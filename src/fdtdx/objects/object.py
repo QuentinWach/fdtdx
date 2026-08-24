@@ -1,6 +1,6 @@
 from abc import ABC
 from dataclasses import dataclass
-from typing import Literal, Self
+from typing import TYPE_CHECKING, Literal, Self
 
 import jax
 
@@ -14,6 +14,10 @@ from fdtdx.core.jax.pytrees import (
     private_field,
 )
 from fdtdx.core.misc import ensure_slice_tuple
+
+if TYPE_CHECKING:
+    from fdtdx.fdtd.container import ObjectContainer
+
 from fdtdx.typing import (
     INVALID_SLICE_TUPLE_3D,
     UNDEFINED_SHAPE_3D,
@@ -239,6 +243,12 @@ class SimulationObject(TreeClass, ABC):
     _grid_slice_tuple: SliceTuple3D = frozen_private_field(
         default=INVALID_SLICE_TUPLE_3D,
     )
+    #: Slice this object would occupy without mirror-symmetry reduction, expressed in the
+    #: reduced grid's coordinates. Set by place_objects only when config.symmetry is active;
+    #: read via unreduced_grid_slice_tuple.
+    _unreduced_grid_slice_tuple: SliceTuple3D = frozen_private_field(
+        default=INVALID_SLICE_TUPLE_3D,
+    )
     _config: SimulationConfig = private_field()
 
     @property
@@ -246,6 +256,80 @@ class SimulationObject(TreeClass, ABC):
         if self._grid_slice_tuple == INVALID_SLICE_TUPLE_3D:
             raise Exception(f"Object is not yet initialized: {self}")
         return self._grid_slice_tuple
+
+    @property
+    def unreduced_grid_slice_tuple(self) -> SliceTuple3D:
+        """Full-domain slice of this object, in the reduced grid's coordinate frame.
+
+        Identical to :attr:`grid_slice_tuple` unless ``config.symmetry`` clipped this object.
+        Where the object crossed a symmetry plane the start index is **negative**: the plane sits
+        at reduced index 0, so an object that straddled it extends to negative coordinates. Object
+        contents that depend on the object's full extent (e.g. a Gaussian beam's centre) must be
+        derived from this slice, not from the clipped one.
+
+        Returns:
+            SliceTuple3D: Per-axis ``(start, stop)`` in reduced-grid coordinates.
+        """
+        if self._unreduced_grid_slice_tuple == INVALID_SLICE_TUPLE_3D:
+            return self.grid_slice_tuple
+        return self._unreduced_grid_slice_tuple
+
+    @property
+    def unreduced_grid_shape(self) -> GridShape3D:
+        """Grid shape this object would have without mirror-symmetry reduction."""
+        tpl = self.unreduced_grid_slice_tuple
+        return (
+            tpl[0][1] - tpl[0][0],
+            tpl[1][1] - tpl[1][0],
+            tpl[2][1] - tpl[2][0],
+        )
+
+    def straddles_symmetry_plane(self, axis: int) -> bool:
+        """Whether ``config.symmetry`` clipped this object on ``axis`` because it crossed the plane.
+
+        This is strictly stronger than "the clipped slice starts at index 0": an object that
+        happens to begin exactly at the symmetry plane but lies entirely inside the kept half was
+        not clipped and must not be treated as mirror-extended.
+
+        Args:
+            axis (int): Physical axis (0=x, 1=y, 2=z).
+
+        Returns:
+            bool: True if the object extends past the symmetry plane into the discarded half.
+        """
+        return self.unreduced_grid_slice_tuple[axis][0] < 0
+
+    @property
+    def straddled_symmetry_axes(self) -> tuple[int, ...]:
+        """Axes on which this object was clipped by a symmetry plane (see straddles_symmetry_plane)."""
+        return tuple(a for a in range(3) if self.straddles_symmetry_plane(a))
+
+    def symmetry_mirror_axes(self, exclude_axis: int | None = None) -> tuple[int, ...]:
+        """Axes that must be mirrored to reconstruct this object's full-domain extent.
+
+        Args:
+            exclude_axis (int | None): Axis to skip, e.g. a plane object's propagation axis, which
+                is one cell thick and therefore never split by a plane.
+
+        Returns:
+            tuple[int, ...]: Straddled symmetry axes, excluding ``exclude_axis``.
+        """
+        return tuple(a for a in self.straddled_symmetry_axes if a != exclude_axis)
+
+    def touches_symmetry_plane(self, axis: int) -> bool:
+        """Whether this object's placed slice begins on the symmetry plane of ``axis``.
+
+        True both for objects clipped by the plane and for objects that merely start there; use
+        :meth:`straddles_symmetry_plane` to distinguish the two.
+
+        Args:
+            axis (int): Physical axis (0=x, 1=y, 2=z).
+
+        Returns:
+            bool: True if ``config.symmetry`` is active on ``axis`` and the object sits at its
+            reduced min edge, where the PEC/PMC mirror wall lives.
+        """
+        return self._config.symmetry[axis] != 0 and self.grid_slice_tuple[axis][0] == 0
 
     @property
     def grid_slice(self) -> Slice3D:
@@ -256,13 +340,24 @@ class SimulationObject(TreeClass, ABC):
 
     @property
     def real_shape(self) -> RealShape3D:
+        """Physical side lengths covered by this object's placed grid slice.
+
+        The value is derived from ``SimulationConfig.grid`` when available.  That
+        keeps object geometry tied to physical edge coordinates instead of a
+        global scalar resolution.  During early placement, before a concrete grid
+        has been attached to the config, the legacy uniform-resolution fallback is
+        still used for compatibility.
+        """
+        grid = self._config.resolved_grid
+        if grid is not None:
+            return grid.slice_extent(self.grid_slice_tuple)
         grid_shape = self.grid_shape
-        real_shape = (
-            grid_shape[0] * self._config.resolution,
-            grid_shape[1] * self._config.resolution,
-            grid_shape[2] * self._config.resolution,
+        spacing = self._config.uniform_spacing()
+        return (
+            grid_shape[0] * spacing,
+            grid_shape[1] * spacing,
+            grid_shape[2] * spacing,
         )
-        return real_shape
 
     @property
     def grid_shape(self) -> GridShape3D:
@@ -283,10 +378,17 @@ class SimulationObject(TreeClass, ABC):
         del key
         if self._grid_slice_tuple != INVALID_SLICE_TUPLE_3D:
             raise Exception(f"Object is already compiled to grid: {self}")
+
         for axis in range(3):
             s1, s2 = grid_slice_tuple[axis]
-            if s1 < 0 or s2 < 0 or s2 <= s1:
-                raise Exception(f"Invalid placement of object {self} at {grid_slice_tuple}")
+
+            # Basic sanity: indices must be non-negative and size must be positive
+            if s1 < 0 or s2 <= s1:
+                raise Exception(
+                    f"Invalid placement of object '{self.name}' at {grid_slice_tuple}. "
+                    f"Axis {axis}: slice [{s1}, {s2}] has negative indices or non-positive size."
+                )
+
         self = self.aset("_grid_slice_tuple", grid_slice_tuple)
         self = self.aset("_config", config, create_new_ok=True)
         return self
@@ -296,9 +398,34 @@ class SimulationObject(TreeClass, ABC):
         key: jax.Array,
         inv_permittivities: jax.Array,
         inv_permeabilities: jax.Array | float,
+        dispersive_c1: jax.Array | None = None,
+        dispersive_c2: jax.Array | None = None,
+        dispersive_c3: jax.Array | None = None,
+        electric_conductivity: jax.Array | None = None,
     ) -> Self:
         del key, inv_permittivities, inv_permeabilities
+        del dispersive_c1, dispersive_c2, dispersive_c3
+        del electric_conductivity
         return self
+
+    def validate_placement(self, objects: "ObjectContainer") -> list[str]:
+        """Validate this object against the fully-resolved object container.
+
+        Called once by :func:`~fdtdx.fdtd.initialization.place_objects` after every
+        object has been placed and the container built, giving cross-object checks
+        (e.g. a source verifying the boundaries around it) a place to run. Returns a
+        list of human-readable error messages; an empty list means the placement is
+        valid. The default implementation performs no checks.
+
+        Args:
+            objects (ObjectContainer): The fully-resolved container of all placed
+                objects (exposes ``.volume``, ``.boundary_objects``, ``.sources``, ...).
+
+        Returns:
+            list[str]: Error messages describing invalid placement, or ``[]``.
+        """
+        del objects
+        return []
 
     def place_relative_to(
         self,
@@ -789,44 +916,3 @@ class SimulationObject(TreeClass, ABC):
 @autoinit
 class OrderableObject(SimulationObject):
     placement_order: int = frozen_field(default=0)
-
-    class EmptySimulationObject(SimulationObject):
-        # Add a large background object (covers most of the volume)
-        class LargeObject(SimulationObject):
-            def __init__(self):
-                super().__init__(
-                    partial_real_shape=(480 * 20e-9, 480 * 20e-9, 480 * 20e-9),  # 480 grid points * resolution
-                    partial_grid_shape=(10, 10, 10),
-                    name="large_background",
-                )
-                self.color = Color.from_rgb(216, 220, 214)
-
-        # Add a smaller centered object
-        class CenterObject(SimulationObject):
-            def __init__(self):
-                super().__init__(
-                    partial_real_shape=(100 * 20e-9, 100 * 20e-9, 100 * 20e-9),  # 100 grid points * resolution
-                    partial_grid_shape=(200, 200, 200),
-                    name="center_object",
-                )
-                self.color = Color.from_rgb(249, 115, 6)
-
-        # Add a thin vertical object
-        class VerticalObject(SimulationObject):
-            def __init__(self):
-                super().__init__(
-                    partial_real_shape=(50 * 20e-9, 50 * 20e-9, 200 * 20e-9),  # grid points * resolution
-                    partial_grid_shape=(350, 350, 150),
-                    name="vertical_object",
-                )
-                self.color = Color.from_rgb(1, 101, 252)
-
-        # Add a horizontal slab
-        class HorizontalSlab(SimulationObject):
-            def __init__(self):
-                super().__init__(
-                    partial_real_shape=(200 * 20e-9, 200 * 20e-9, 30 * 20e-9),  # grid points * resolution
-                    partial_grid_shape=(100, 100, 400),
-                    name="horizontal_slab",
-                )
-                self.color = Color.from_rgb(6, 71, 12)

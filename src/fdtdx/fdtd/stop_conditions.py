@@ -107,7 +107,7 @@ class EnergyThresholdCondition(StoppingCondition):
         )
         self = self.aset(
             "min_steps",
-            int(round(config.time_steps_total * 0.1)) if self.min_steps is None else self.min_steps,
+            round(config.time_steps_total * 0.1) if self.min_steps is None else self.min_steps,
             create_new_ok=True,
         )
         self._validate(state, config, objects)
@@ -133,10 +133,14 @@ class EnergyThresholdCondition(StoppingCondition):
         Returns:
             jax.Array: Boolean scalar - True if condition not met and curr_time_step < max_steps.
         """
+        if self.max_steps is None or self.min_steps is None:
+            raise RuntimeError("EnergyThresholdCondition.setup() must be called before use. ")
         curr_time_step, arrays = state
         time_condition = curr_time_step < self.max_steps
         min_steps_condition = curr_time_step < self.min_steps
-        total_energy = jnp.sum(compute_energy(arrays.E, arrays.H, arrays.inv_permittivities, arrays.inv_permeabilities))
+        total_energy = jnp.sum(
+            compute_energy(arrays.fields.E, arrays.fields.H, arrays.inv_permittivities, arrays.inv_permeabilities)
+        )
         converged = total_energy < self.threshold
 
         return time_condition & (min_steps_condition | ~converged)
@@ -190,18 +194,18 @@ class DetectorConvergenceCondition(StoppingCondition):
     threshold: float = frozen_field(default=1e-6)
     min_steps: int | None = frozen_field(default=None)
     max_steps: int | None = frozen_field(default=None)
-    _spp: int | None = frozen_private_field(default=None)  # type: ignore
+    _spp: int | None = frozen_private_field(default=None)
 
     def setup(self, state: SimulationState, config: SimulationConfig, objects: ObjectContainer) -> Self:
         """Setting up internal attributes and validating inputs."""
-        spp = int(round(self.wave_character.get_period() / config.time_step_duration))
+        spp = round(self.wave_character.get_period() / config.time_step_duration)
         self = self.aset("_spp", spp, create_new_ok=True)
         self = self.aset(
             "max_steps", config.time_steps_total if self.max_steps is None else self.max_steps, create_new_ok=True
         )
         self = self.aset(
             "min_steps",
-            int(round((self.prev_periods + 1) * spp)) if self.min_steps is None else self.min_steps,
+            round((self.prev_periods + 1) * spp) if self.min_steps is None else self.min_steps,
             create_new_ok=True,
         )
         self._validate(state, config, objects)
@@ -209,6 +213,8 @@ class DetectorConvergenceCondition(StoppingCondition):
         return self
 
     def _validate(self, state: SimulationState, config: SimulationConfig, objects: ObjectContainer) -> None:
+        if self._spp is None:
+            raise RuntimeError("DetectorConvergenceCondition: _spp was not initialized. Run setup() first.")
         _, arrays = state
 
         if (self.prev_periods + 1) * self._spp > config.time_steps_total:
@@ -250,7 +256,8 @@ class DetectorConvergenceCondition(StoppingCondition):
 
         if self.threshold < 0:
             raise ValueError(f"Detector convergence threshold must be non-negative, got {self.threshold}.")
-
+        if self.min_steps is None:
+            raise RuntimeError("DetectorConvergenceCondition: min_steps was not initialized.")
         if self.min_steps is not None and self.min_steps < (self.prev_periods + 1) * self._spp:
             raise ValueError(
                 "min_steps must be larger than the number of steps used to compute convergence, "
@@ -272,24 +279,34 @@ class DetectorConvergenceCondition(StoppingCondition):
         Returns:
             jax.Array: Boolean scalar - True if condition not met and curr_time_step < max_steps.
         """
+        if self._spp is None or self.min_steps is None or self.max_steps is None:
+            raise RuntimeError("DetectorConvergenceCondition.setup() must be called before use.")
+
+        # Assigning to local Variables
+        spp = self._spp
+        min_steps = self.min_steps
+
+        threshold = self.threshold
+        prev_periods = self.prev_periods
+
         curr_time_step, arrays = state
         converged: jnp.ndarray = jnp.array(False, dtype=bool)
         readings: jax.Array = next(iter(arrays.detector_states[self.detector_name].values()))
 
         # Always continue if below minimum steps, always stop if at end_step
         time_condition = curr_time_step < config.time_steps_total
-        min_steps_condition = curr_time_step >= self.min_steps
+        min_steps_condition = curr_time_step >= min_steps
 
         # Wrapping this in a func so we don't compute it until min_steps_condition == True
         def _compute_converged(_):
-            start_ref = curr_time_step - (self.prev_periods + 1) * self._spp
-            start_last = curr_time_step - self._spp
+            start_ref = curr_time_step - (prev_periods + 1) * spp
+            start_last = curr_time_step - spp
 
             # Clamp to valid bounds to avoid OOB under JIT (it doesn't like that)
-            start_ref = jnp.clip(start_ref, 0, config.time_steps_total - self.prev_periods * self._spp)
-            start_last = jnp.clip(start_last, 0, config.time_steps_total - self._spp)
+            start_ref = jnp.clip(start_ref, 0, config.time_steps_total - prev_periods * spp)
+            start_last = jnp.clip(start_last, 0, config.time_steps_total - spp)
 
-            ref_2d = jax.lax.dynamic_slice(readings, (start_ref, 0), (self.prev_periods * self._spp, 1))
+            ref_2d = jax.lax.dynamic_slice(readings, (start_ref, 0), (prev_periods * spp, 1))
             last_2d = jax.lax.dynamic_slice(readings, (start_last, 0), (self._spp, 1))
 
             readings_ref = jnp.squeeze(ref_2d, axis=1)  # (k*spp,)
@@ -303,7 +320,7 @@ class DetectorConvergenceCondition(StoppingCondition):
             fft_last = jnp.fft.rfft(readings_last, n=self._spp)  # (spp//2 + 1,)
 
             spectra_distance = jnp.linalg.norm(jnp.abs(fft_ref) - jnp.abs(fft_last))
-            return spectra_distance < self.threshold
+            return spectra_distance < threshold
 
         converged = jax.lax.cond(
             min_steps_condition,

@@ -6,6 +6,7 @@ import jax.numpy as jnp
 from loguru import logger
 
 from fdtdx import constants
+from fdtdx.core.grid import QuasiUniformGrid, RectilinearGrid, UniformGrid
 from fdtdx.core.jax.pytrees import TreeClass, autoinit, field, frozen_field
 from fdtdx.interfaces.recorder import Recorder
 from fdtdx.typing import BackendOption
@@ -31,11 +32,25 @@ class GradientConfig(TreeClass):
     #: Needs to be provided for checkpointing gradient computation. Defaults to None.
     num_checkpoints: int | None = frozen_field(default=None)
 
+    #: Number of interior full-field checkpoints for the ``"reversible"`` method.
+    #: The reversible backward pass reconstructs the field state by running the simulation in
+    #: reverse; for lossy materials this reverse reconstruction can accumulate numerical
+    #: error over the full trajectory. Setting this to ``k - 1`` partitions the run into ``k`` slices
+    #: and stores a full-field checkpoint at each interior slice boundary during the forward pass. The
+    #: backward pass then resets the reverse reconstruction to the exact checkpoint at every boundary,
+    #: bounding the reconstruction drift to a single slice (``~time_steps_total / k`` steps) at the
+    #: cost of O(k) field memory. The default ``0`` reproduces the classic single full reverse pass
+    #: (no interior checkpoints; only the final field, which is available for free, is used). Ignored
+    #: by the ``"checkpointed"`` method. Must not exceed ``time_steps_total - 1``.
+    num_checkpoints_reversible: int = frozen_field(default=0)
+
     def __post_init__(self):
         if self.method == "reversible" and self.recorder is None:
             raise Exception("Need Recorder in gradient config to compute reversible gradients")
         if self.method == "checkpointed" and self.num_checkpoints is None:
             raise Exception("Need Checkpoint Number in gradient config to compute checkpointed gradients")
+        if self.num_checkpoints_reversible < 0:
+            raise Exception("num_checkpoints_reversible must be >= 0")
 
 
 @autoinit
@@ -51,8 +66,13 @@ class SimulationConfig(TreeClass):
     #: Total simulation time in seconds.
     time: float = frozen_field()
 
-    #: Spatial resolution of the simulation grid in meters.
-    resolution: float = frozen_field()
+    #: Spatial grid configuration.
+    #:
+    #: ``UniformGrid`` is an unresolved policy used while the final volume shape
+    #: is still being inferred.  ``RectilinearGrid`` is the realized solver grid
+    #: with explicit physical edge coordinates.  Placement resolves policies to
+    #: ``RectilinearGrid`` so compiled FDTD code has exactly one metric source.
+    grid: UniformGrid | QuasiUniformGrid | RectilinearGrid = field()
 
     #: Computation backend ('gpu', 'tpu', 'cpu' or 'METAL'). Defaults to "gpu".
     backend: BackendOption = frozen_field(default="gpu")
@@ -60,14 +80,48 @@ class SimulationConfig(TreeClass):
     #:  Data type for numerical computations. Defaults to jnp.float32.
     dtype: jnp.dtype = frozen_field(default=jnp.float32)
 
+    #: Whether to use complex-valued field arrays.
+    #: None (default): auto-detect based on boundary conditions (e.g. Bloch).
+    #: True: force complex fields (complex64 if dtype=float32, complex128 if dtype=float64).
+    #: False: force real fields (raises error if Bloch boundaries are present).
+    use_complex_fields: bool | None = frozen_field(default=None)
+
     #: Safety factor for the Courant condition (default: 0.99).
     courant_factor: float = frozen_field(default=0.99)
+
+    #: Per-axis mirror symmetry of the simulation, in the order (x, y, z).
+    #: Each entry is one of ``{-1, 0, +1}``:
+    #: ``0`` = no symmetry on this axis (default),
+    #: ``-1`` = PEC (electric-wall) mirror on the axis center plane,
+    #: ``+1`` = PMC (magnetic-wall) mirror on the axis center plane.
+    #: When any entry is nonzero, :func:`fdtdx.place_objects` automatically reduces the
+    #: domain to the symmetric half/quarter/octant (keeping the upper half along each
+    #: symmetric axis) and clips every object onto that reduced grid. An electric plane
+    #: lands on the reduced domain's min edge and gets a PEC wall there; a magnetic plane
+    #: sits half a cell below it (sources and materials are rasterized per cell), where the
+    #: zero field halo already is the exact mirror, so it gets no wall object. Mode sources
+    #: and mode-overlap detectors solve on the mirrored full cross-section and restrict,
+    #: rather than using the mode solver's own symmetric solve. The FDTD then runs on the
+    #: reduced domain; call
+    #: :func:`fdtdx.unfold_fields` / :func:`fdtdx.unfold_detector_states` afterwards to
+    #: reconstruct the full-domain arrays. This is additive and independent of manually
+    #: specifying PEC/PMC as ordinary boundaries via :class:`fdtdx.BoundaryConfig`.
+    #: Each symmetric axis must resolve to an **even** number of grid cells (so the domain
+    #: splits exactly down the middle and the unfolded result matches the full domain
+    #: cell-for-cell); otherwise :func:`fdtdx.place_objects` raises a ``ValueError``.
+    symmetry: tuple[int, int, int] = frozen_field(default=(0, 0, 0))
 
     #: Optional configuration for gradient computation.
     gradient_config: GradientConfig | None = field(default=None)
 
     def __post_init__(self):
         from jax import extend
+
+        if len(self.symmetry) != 3 or any(s not in (-1, 0, 1) for s in self.symmetry):
+            raise ValueError(
+                f"config.symmetry must be a length-3 tuple with each entry in {{-1, 0, +1}} "
+                f"(0=none, -1=PEC, +1=PMC), got {self.symmetry!r}"
+            )
 
         current_platform = extend.backend.get_backend().platform
 
@@ -99,6 +153,16 @@ class SimulationConfig(TreeClass):
             jax.config.update("jax_platform_name", "cpu")
 
     @property
+    def has_symmetry(self) -> bool:
+        """Whether any axis requests mirror symmetry.
+
+        Returns:
+            bool: True if at least one entry of :attr:`symmetry` is nonzero, meaning the
+                domain will be reduced and a PEC/PMC wall placed on the symmetry plane(s).
+        """
+        return any(s != 0 for s in self.symmetry)
+
+    @property
     def courant_number(self) -> float:
         """Calculate the Courant number for the simulation.
 
@@ -112,19 +176,79 @@ class SimulationConfig(TreeClass):
         """
         return self.courant_factor / math.sqrt(3)
 
+    def resolve_grid(self, shape: tuple[int, int, int] | None = None) -> RectilinearGrid:
+        """Return a concrete solver grid.
+
+        Args:
+            shape: Required when ``grid`` is an unresolved ``UniformGrid``.
+
+        Returns:
+            A concrete ``RectilinearGrid``.
+        """
+        if isinstance(self.grid, RectilinearGrid):
+            return self.grid
+        if shape is None:
+            raise ValueError("A grid shape is required to resolve UniformGrid.")
+        return self.grid.resolve(shape)
+
+    @property
+    def resolved_grid(self) -> RectilinearGrid | None:
+        """Return the concrete solver grid, or ``None`` if not yet resolved.
+
+        ``UniformGrid`` has no edge arrays until the simulation shape is known.
+        Callers that need coordinates, areas, or volumes should use this
+        property and fall back to ``uniform_spacing`` when it returns ``None``.
+        """
+        if isinstance(self.grid, RectilinearGrid):
+            return self.grid
+        return None
+
+    @property
+    def has_nonuniform_grid(self) -> bool:
+        """Whether the realized solver grid is non-uniform."""
+        grid = self.resolved_grid
+        return grid is not None and not grid.is_uniform
+
+    def uniform_spacing(self) -> float:
+        """Return the uniform grid spacing.
+
+        ``UniformGrid`` can answer this before placement.  ``RectilinearGrid``
+        answers only when all spacings are equal and raises for non-uniform
+        meshes, making unsupported scalar assumptions explicit.
+        """
+        if isinstance(self.grid, UniformGrid):
+            return self.grid.spacing
+        if isinstance(self.grid, QuasiUniformGrid):
+            if self.grid.is_uniform:
+                return self.grid.dx
+            else:
+                raise ValueError(
+                    "QuasiUniformGrid has no single uniform spacing:"
+                    f" ({self.grid.dx}, {self.grid.dy}, {self.grid.dz} differ). "
+                )
+        return self.grid.uniform_spacing  # RectilinearGrid — raises internally if non-uniform
+
     @property
     def time_step_duration(self) -> float:
         """Calculate the duration of a single time step.
 
         The time step duration is determined by the Courant condition to ensure
-        numerical stability. It depends on the spatial resolution and the speed
-        of light.
+        numerical stability. Realized rectilinear grids use their smallest
+        per-axis spacings. Unresolved uniform grids use their configured scalar
+        spacing; unresolved quasi-uniform grids use their smallest per-axis
+        spacing as a conservative CFL bound.
 
         Returns:
             float: Time step duration in seconds, calculated using the Courant
                 condition and spatial resolution.
         """
-        return self.courant_number * self.resolution / constants.c
+        if isinstance(self.grid, RectilinearGrid):
+            return self.grid.cfl_time_step(self.courant_factor)
+        if isinstance(self.grid, UniformGrid):
+            return self.courant_number * self.grid.spacing / constants.c
+        if isinstance(self.grid, QuasiUniformGrid):
+            return self.courant_number * self.grid.min_spacing / constants.c
+        raise NotImplementedError(f"time_step_duration is not implemented for grid type {type(self.grid).__name__}.")
 
     @property
     def time_steps_total(self) -> int:
@@ -185,5 +309,5 @@ class SimulationConfig(TreeClass):
 
 DUMMY_SIMULATION_CONFIG = SimulationConfig(
     time=-1,
-    resolution=-1,
+    grid=UniformGrid(spacing=1),
 )

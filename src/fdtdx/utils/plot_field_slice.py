@@ -33,13 +33,26 @@ def plot_field_slice_component(
     if jnp.any(jnp.isinf(field)):
         raise ValueError(f"{component_name} contains infinite values")
 
+    # Min-max recenter-at-0 scheme: make vmin/vmax symmetric about zero so
+    # the diverging colormap's white midpoint always corresponds to 0,
+    # regardless of whether the field skews positive or negative.
+    max_abs = float(jnp.max(jnp.abs(field)))
+    if max_abs == 0:
+        # Avoid a degenerate (0, 0) color range for an all-zero field
+        max_abs = 1e-12
+    vmin, vmax = -max_abs, max_abs
+
     # Plot the field component
+    h, w = field.T.shape
     im = ax.imshow(
         field.T,  # Transpose for correct orientation
         origin="lower",
+        extent=[-w / 2, w / 2, -h / 2, h / 2],
         aspect="equal",
         cmap="RdBu_r",  # Red-blue colormap, centered at zero
         interpolation="nearest",
+        vmin=vmin,
+        vmax=vmax,
     )
 
     # Set labels and title
@@ -145,6 +158,7 @@ def plot_field_slice(
 
     # Plot E field components (top row)
     for i, comp_name in enumerate(E_components):
+        assert axs is not None
         plot_field_slice_component(
             field=E[i],
             component_name=comp_name,
@@ -154,6 +168,7 @@ def plot_field_slice(
 
     # Plot H field components (bottom row)
     for i, comp_name in enumerate(H_components):
+        assert axs is not None
         plot_field_slice_component(
             field=H[i],
             component_name=comp_name,

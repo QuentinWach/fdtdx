@@ -44,7 +44,7 @@ def main(
     # Define simulation configuration (time, resolution, data type, etc.)
     config = fdtdx.SimulationConfig(
         time=50e-15,
-        resolution=20e-9,
+        grid=fdtdx.UniformGrid(spacing=20e-9),
         dtype=jnp.float32,
         courant_factor=0.99,
     )
@@ -426,7 +426,7 @@ def main(
             (loss, (arrays, info)), grads = jitted_loss(params, arrays, subkey, idx_arr)
 
             # Update optimizer state and parameters
-            updates, opt_state_finetune = optimizer_finetune.update(grads, opt_state_finetune, params) # type: ignore
+            updates, opt_state_finetune = optimizer_finetune.update(grads, opt_state_finetune, params)
             info["lr"] = opt_state_finetune.inner_opt_state.hyperparams["learning_rate"]
             params = optax.apply_updates(params, updates)
             # Clip parameters to [0, 1] range

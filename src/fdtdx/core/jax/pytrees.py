@@ -1,7 +1,10 @@
+import inspect
+import sys
 from dataclasses import dataclass, fields
 from typing import Any, Callable, Literal, Self, Sequence, TypeVar, overload
 
 import pytreeclass as tc
+from pytreeclass._src import code_build as _ptc_code_build
 from pytreeclass._src.code_build import (
     ArgKindType,
     Field,
@@ -15,6 +18,64 @@ from pytreeclass._src.code_build import (
 from pytreeclass._src.tree_base import TreeClassIndexer
 
 from fdtdx.core.null import NULL
+
+_KlassT = TypeVar("_KlassT")
+
+if sys.version_info >= (3, 14):
+    # PEP 649 (deferred annotations) changed how class annotations are stored:
+    # they are no longer placed in ``cls.__dict__`` as ``__annotations__``, but
+    # produced lazily by ``cls.__annotate_func__``. ``pytreeclass`` reads
+    # ``vars(klass).get("__annotations__")`` in two hot paths, which silently
+    # returns ``None`` on 3.14 and yields field-less classes (so ``autoinit``
+    # builds an empty ``__init__``).
+    #
+    # We patch the two affected functions in-place so every caller — including
+    # those inside ``pytreeclass`` itself — uses ``inspect.get_annotations``,
+    # which returns only the locally-declared annotations and matches the
+    # upstream semantics.
+    _PTC_NULL = _ptc_code_build.NULL
+    _ptc_check_excluded_type = _ptc_code_build.check_excluded_type
+
+    def _patched_build_field_map(klass: type) -> dict[str, Field]:
+        field_map: dict[str, Field] = dict()
+        excluded = {"self", "__post_init__", "__annotations__"}
+
+        if klass is object:
+            return dict(field_map)
+
+        for base in reversed(klass.__mro__[1:]):
+            field_map.update(_patched_build_field_map(base))
+
+        hint_map = inspect.get_annotations(klass)
+        if not hint_map:
+            return dict(field_map)
+
+        if excluded.intersection(hint_map):
+            raise ValueError(f"`Field` name cannot be in {excluded=}")
+
+        for key, hint in hint_map.items():
+            value = vars(klass).get(key, _PTC_NULL)
+            if not isinstance(value, Field):
+                continue
+            _ptc_check_excluded_type(value.default)
+            field_map[key] = value.replace(name=key, type=hint)
+
+        return field_map
+
+    def _patched_convert_hints_to_fields(klass: type[_KlassT]) -> type[_KlassT]:
+        hint_map = inspect.get_annotations(klass)
+        if not hint_map:
+            return klass
+        for key, hint in hint_map.items():
+            if not isinstance(value := vars(klass).get(key, _PTC_NULL), Field):
+                setattr(klass, key, Field(default=value, type=hint, name=key))
+        return klass
+
+    setattr(_ptc_code_build, "build_field_map", _patched_build_field_map)
+    setattr(_ptc_code_build, "convert_hints_to_fields", _patched_convert_hints_to_fields)
+    _convert_hints_to_fields = _patched_convert_hints_to_fields
+else:
+    _convert_hints_to_fields = convert_hints_to_fields
 
 
 def safe_hasattr(obj, name) -> bool:
@@ -32,7 +93,7 @@ class ExtendedTreeClassIndexer(TreeClassIndexer):
     """
 
     def __getitem__(self, where: Any) -> Self:
-        return super().__getitem__(where)  # type: ignore
+        return super().__getitem__(where)
 
 
 @dataclass(frozen=True)
@@ -100,7 +161,7 @@ class TreeClass(tc.TreeClass):
         setattr(self, attr_name, val)
 
     @staticmethod
-    def _parse_operations(s: str) -> list[tuple[str, str]]:
+    def _parse_operations(s: str):
         if not s:
             raise ValueError("Empty string is not valid")
 
@@ -228,7 +289,8 @@ class TreeClass(tc.TreeClass):
             else:
                 raise Exception(f"Invalid operation type: {op_type}. This is an internal bug!")
             if idx != len(ops) - 1:
-                attr_list.append(current_parent)  # type: ignore
+                assert current_parent is not None
+                attr_list.append(current_parent)
 
         # from bottom-up set attributes and update
         cur_attr = val
@@ -245,7 +307,7 @@ class TreeClass(tc.TreeClass):
                         f"Can only update by index if __setitem__ is implemented, but got {current_parent.__class__}"
                     )
                 cpy = current_parent.copy()  # type: ignore
-                cpy[int(op)] = cur_attr  # type: ignore
+                cpy[int(op)] = cur_attr
                 cur_attr = cpy
             elif op_type == "key":
                 if "__setitem__" not in dir(current_parent):
@@ -253,7 +315,7 @@ class TreeClass(tc.TreeClass):
                         f"Can only update by index if __setitem__ is implemented, but got {current_parent.__class__}"
                     )
                 cpy = current_parent.copy()  # type: ignore
-                cpy[op] = cur_attr  # type: ignore
+                cpy[op] = cur_attr
                 cur_attr = cpy
             else:
                 raise Exception(f"Invalid operation type: {op_type}. This is an internal bug!")
@@ -461,8 +523,8 @@ def frozen_field(
         repr=repr,
         kind=kind,
         metadata=metadata,
-        on_setattr=list(on_setattr) + [tc.freeze],
-        on_getattr=[tc.unfreeze] + list(on_getattr),
+        on_setattr=[*list(on_setattr), tc.freeze],
+        on_getattr=[tc.unfreeze, *list(on_getattr)],
         alias=alias,
     )
 
@@ -552,5 +614,5 @@ def autoinit(klass: type[T]) -> type[T]:
         # first convert the current class hints to fields
         # then build the __init__ method from the fields of the current class
         # and any base classes that are decorated with `autoinit`
-        else build_init_method(convert_hints_to_fields(klass))
+        else build_init_method(_convert_hints_to_fields(klass))
     )

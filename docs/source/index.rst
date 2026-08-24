@@ -32,9 +32,7 @@ Install FDTDX using pip:
 
 .. code-block:: bash
 
-   pip install fdtdx  # Basic CPU-Installation
-   pip install fdtdx[cuda12]  # GPU-Acceleration (Highly Recommended!)
-   pip install fdtdx[rocm]   # AMD-GPU (only python<=3.12)
+   pip install fdtdx
 
 
 For development installation, clone the repository and install in editable mode:
@@ -43,7 +41,7 @@ For development installation, clone the repository and install in editable mode:
 
    git clone https://github.com/ymahlau/fdtdx
    cd fdtdx
-   pip install -e . --extra dev
+   pip install -e ".[dev]"
 
 
 
@@ -53,6 +51,7 @@ Citation
 If you find this repository helpful for your work, please consider citing:
 
 .. code-block:: bibtex
+   
    @article{Mahlau2026,
       doi = {10.21105/joss.08912},
       url = {https://doi.org/10.21105/joss.08912},
@@ -69,11 +68,12 @@ If you find this repository helpful for your work, please consider citing:
 
 .. toctree::
    :maxdepth: 1
-   :caption: Contents:
+   :hidden:
    
-   quickstart
-   advanced
-   api
-   contributing
-   faq
-
+   01_quickstart
+   02_physics
+   03_components
+   04_advanced
+   05_contributing
+   06_faq
+   07_api

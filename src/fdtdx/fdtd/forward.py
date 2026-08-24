@@ -1,7 +1,7 @@
 import jax
 
 from fdtdx.config import SimulationConfig
-from fdtdx.fdtd.container import ArrayContainer, ObjectContainer, SimulationState
+from fdtdx.fdtd.container import ArrayContainer, FieldState, ObjectContainer, PmlAuxField, SimulationState
 from fdtdx.fdtd.update import collect_interfaces, update_detector_states, update_E, update_H
 from fdtdx.interfaces.state import RecordingState
 from fdtdx.objects.detectors.detector import DetectorState
@@ -11,11 +11,8 @@ def forward_single_args_wrapper(
     time_step: jax.Array,
     E: jax.Array,
     H: jax.Array,
-    psi_E: jax.Array,
-    psi_H: jax.Array,
-    alpha: jax.Array,
-    kappa: jax.Array,
-    sigma: jax.Array,
+    psi_E: PmlAuxField,
+    psi_H: PmlAuxField,
     inv_permittivities: jax.Array,
     inv_permeabilities: jax.Array,
     detector_states: dict[str, DetectorState],
@@ -26,33 +23,40 @@ def forward_single_args_wrapper(
     record_detectors: bool,
     record_boundaries: bool,
     simulate_boundaries: bool,
+    electric_conductivity: jax.Array | None = None,
+    magnetic_conductivity: jax.Array | None = None,
 ) -> tuple[
     jax.Array,
     jax.Array,
     jax.Array,
-    jax.Array,
-    jax.Array,
-    jax.Array,
-    jax.Array,
-    jax.Array,
+    PmlAuxField,
+    PmlAuxField,
     jax.Array,
     jax.Array | float,
     dict[str, DetectorState],
     RecordingState | None,
 ]:
     # Wrapper function that unpacks ArrayContainer into individual arrays for JAX transformations.
+    # ``electric_conductivity`` and ``magnetic_conductivity`` are passed as defaulted kwargs so
+    # callers can closure-capture them via ``functools.partial`` without exposing them as VJP
+    # primals.
+    #
+    # This wrapper only serves the reversible gradient path, which rejects dispersive materials
+    # (see ``reversible_fdtd``), so the ADE polarization state and coefficient arrays are always
+    # ``None`` here and are not part of the signature.
     arr = ArrayContainer(
-        E=E,
-        H=H,
-        psi_E=psi_E,
-        psi_H=psi_H,
-        alpha=alpha,
-        kappa=kappa,
-        sigma=sigma,
+        fields=FieldState(
+            E=E,
+            H=H,
+            psi_E=psi_E,
+            psi_H=psi_H,
+        ),
         inv_permittivities=inv_permittivities,
         inv_permeabilities=inv_permeabilities,
         detector_states=detector_states,
         recording_state=recording_state,
+        electric_conductivity=electric_conductivity,
+        magnetic_conductivity=magnetic_conductivity,
     )
     state = forward(
         state=(time_step, arr),
@@ -65,13 +69,10 @@ def forward_single_args_wrapper(
     )
     return (
         state[0],
-        state[1].E,
-        state[1].H,
-        state[1].psi_E,
-        state[1].psi_H,
-        state[1].alpha,
-        state[1].kappa,
-        state[1].sigma,
+        state[1].fields.E,
+        state[1].fields.H,
+        state[1].fields.psi_E,
+        state[1].fields.psi_H,
         state[1].inv_permittivities,
         state[1].inv_permeabilities,
         state[1].detector_states,
@@ -114,7 +115,7 @@ def forward(
         SimulationState: Updated simulation state for the next time step
     """
     time_step, arrays = state
-    H_prev = arrays.H
+    H_prev = arrays.fields.H
     arrays = update_E(
         time_step=time_step,
         arrays=arrays,
@@ -146,6 +147,7 @@ def forward(
             time_step=time_step,
             arrays=arrays,
             objects=objects,
+            config=config,
             H_prev=H_prev,
             inverse=False,
         )

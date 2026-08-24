@@ -1,5 +1,3 @@
-from typing import cast
-
 import jax
 import numpy as np
 import seaborn as sns
@@ -55,8 +53,9 @@ def device_matrix_index_figure(
         - Proper axis labels and grid settings
     """
     assert device_matrix_indices.ndim == 3
-
-    fig, ax = cast(tuple[Figure, Axes], plt.subplots(figsize=(12, 12)))
+    fig, ax = plt.subplots(figsize=(12, 12))
+    assert isinstance(fig, Figure)
+    assert isinstance(ax, Axes)
     image_palette = sns.color_palette("YlOrBr", as_cmap=True)
     background_name = get_background_material_name(material)
     ordered_name_list = compute_ordered_names(material)
@@ -106,10 +105,15 @@ def device_matrix_index_figure(
                 text_color = "w" if cax.norm(value) > 0.5 else "k"  # type: ignore
                 ax.text(x, y, str(int(value)), ha="center", va="center", color=text_color)
     assert cax.cmap is not None
+
+    def _get_facecolor(val: int) -> tuple[float, float, float, float]:
+        r, g, b, a = cax.cmap(cax.norm(np.array(val)))
+        return float(r), float(g), float(b), float(a)
+
     if indices.ndim == 1:
         legend_elements = [
             Patch(
-                facecolor=cax.cmap(cax.norm(int(i))),
+                facecolor=_get_facecolor(int(i)),
                 label=f"({i}) {ordered_name_list[int(i)]}",
             )
             for i in indices
@@ -117,7 +121,7 @@ def device_matrix_index_figure(
     else:
         legend_elements = [
             Patch(
-                facecolor=cax.cmap(cax.norm(int(i))),
+                facecolor=_get_facecolor(int(i)),
                 label=f"({i}) " + "|".join([ordered_name_list[int(e)] for e in indices[i]]),
             )
             for i in np.unique(matrix_inverse_permittivity_indices_sorted)

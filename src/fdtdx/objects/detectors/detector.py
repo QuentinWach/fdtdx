@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import Self
+from typing import ClassVar, Literal, Self
 
 import jax
 import jax.numpy as jnp
@@ -7,7 +7,7 @@ import numpy as np
 from matplotlib.figure import Figure
 from rich.progress import Progress
 
-from fdtdx.colors import XKCD_LIGHT_GREEN
+from fdtdx.colors import XKCD_LIGHT_GREEN, Color
 from fdtdx.config import SimulationConfig
 from fdtdx.core.jax.pytrees import autoinit, frozen_field, frozen_private_field, private_field
 from fdtdx.core.switch import OnOffSwitch
@@ -54,7 +54,7 @@ class Detector(SimulationObject, ABC):
     num_video_workers: int | None = frozen_field(default=None)  # only used when generating video
 
     #: RGB color for plotting. Defaults to light green.
-    color: tuple[float, float, float] | None = frozen_field(default=XKCD_LIGHT_GREEN)
+    color: Color | None = frozen_field(default=XKCD_LIGHT_GREEN)
 
     #: Interpolation method for plots. Defualts to "gaussian".
     plot_interpolation: str = frozen_field(default="gaussian")
@@ -62,9 +62,17 @@ class Detector(SimulationObject, ABC):
     #: DPI resolution for plots. Defaults to None.
     plot_dpi: int | None = frozen_field(default=None)
 
+    #: Whether this detector records signed, zero-centered data (e.g. field
+    #: components Ex/Ey/Ez/Hx/Hy/Hz) vs. strictly non-negative data (e.g. energy
+    #: density, |E|^2, Poynting magnitude). Controls the default colormap and
+    #: normalization used by draw_plot. Override in subclasses that record
+    #: non-negative quantities.
+    _signed_data: ClassVar[bool] = True
+
     _num_time_steps_on: int = frozen_private_field()
     _is_on_at_time_step_arr: jax.Array = private_field()
     _time_step_to_arr_idx: jax.Array = private_field()
+    _cached_cell_volume_weights: jax.Array = private_field()
 
     @property
     def num_time_steps_recorded(self) -> int:
@@ -79,6 +87,78 @@ class Detector(SimulationObject, ABC):
         if self._num_time_steps_on is None:
             raise Exception("Detector is not yet initialized")
         return self._num_time_steps_on
+
+    def _cell_volume_weights(self) -> jax.Array:
+        """Return physical cell-volume weights for this detector's grid slice."""
+        return self._cached_cell_volume_weights
+
+    def _volume_weighted_spatial_mean(self, values: jax.Array, leading_dims: int) -> jax.Array:
+        """Average spatial detector samples using physical cell volumes.
+
+        Args:
+            values: Array whose final three dimensions match ``grid_shape``.
+            leading_dims: Number of leading non-spatial dimensions to preserve,
+                such as component or frequency axes.
+
+        Returns:
+            ``values`` averaged over the three spatial dimensions.
+        """
+        weights = self._cell_volume_weights()
+        weight_shape = (1,) * leading_dims + weights.shape
+        spatial_axes = tuple(range(leading_dims, values.ndim))
+        return jnp.sum(values * weights.reshape(weight_shape), axis=spatial_axes) / jnp.sum(weights)
+
+    def _plot_axis_centers_um(self, axis: int) -> np.ndarray:
+        """Return detector-local cell centers in micrometres for plotting.
+
+        Rectilinear grids use the physical cell centers from ``RectilinearGrid``.  The
+        coordinates are shifted so plots start at the detector slice origin,
+        matching the historical uniform-grid display convention.
+        """
+        grid = self._config.resolved_grid
+        if grid is not None:
+            start, stop = self.grid_slice_tuple[axis]
+            edges = np.asarray(grid.edges(axis)[start : stop + 1])
+            centers = 0.5 * (edges[:-1] + edges[1:])
+            return (centers - edges[0]) / 1.0e-6
+
+        spacing = self._config.uniform_spacing()
+        return (np.arange(self.grid_shape[axis]) + 0.5) * spacing / 1.0e-6
+
+    def _plot_axis_edges_um(self, axis: int) -> np.ndarray:
+        """Return detector-local cell edges in micrometres for slice plots."""
+        grid = self._config.resolved_grid
+        if grid is not None:
+            start, stop = self.grid_slice_tuple[axis]
+            edges = np.asarray(grid.edges(axis)[start : stop + 1])
+            return (edges - edges[0]) / 1.0e-6
+
+        spacing = self._config.uniform_spacing()
+        return np.arange(self.grid_shape[axis] + 1) * spacing / 1.0e-6
+
+    def _plot_resolutions(self) -> tuple[float, float, float]:
+        """Return a scalar-resolution tuple for legacy plotting APIs.
+
+        When a non-uniform ``RectilinearGrid`` is present this value is only a fallback
+        for call signatures; rectilinear plots receive explicit edge arrays and
+        do not use the scalar spacing to position cells.
+        """
+        if self._config.has_nonuniform_grid:
+            assert self._config.resolved_grid is not None
+            spacing = self._config.resolved_grid.min_spacing
+            return (spacing, spacing, spacing)
+        spacing = self._config.uniform_spacing()
+        return (spacing, spacing, spacing)
+
+    def _plot_coordinate_edges_um(self) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
+        """Return rectilinear detector edge coordinates when needed for plots."""
+        if not self._config.has_nonuniform_grid:
+            return None
+        return (
+            self._plot_axis_edges_um(0),
+            self._plot_axis_edges_um(1),
+            self._plot_axis_edges_um(2),
+        )
 
     def _calculate_on_list(
         self,
@@ -138,6 +218,14 @@ class Detector(SimulationObject, ABC):
                 counter += 1
         time_to_arr_idx_arr = jnp.asarray(time_to_arr_idx_list, dtype=jnp.int32)
         self = self.aset("_time_step_to_arr_idx", time_to_arr_idx_arr, create_new_ok=True)
+        # compute cell volume weights now that config and grid_slice are available
+        grid = self._config.resolved_grid
+        if grid is not None:
+            weights = grid.cell_volume(self.grid_slice_tuple)
+        else:
+            spacing = self._config.uniform_spacing()
+            weights = jnp.ones(self.grid_shape, dtype=self.dtype) * spacing**3
+        self = self.aset("_cached_cell_volume_weights", weights, create_new_ok=True)
         return self
 
     def init_state(
@@ -167,6 +255,10 @@ class Detector(SimulationObject, ABC):
     ) -> DetectorState:
         """Updates detector state with current field values.
 
+        Note that fields and materials arrive already restricted to this detector's ``grid_slice``
+        and, when ``exact_interpolation`` is set, already co-located onto the E_z Yee point, so
+        implementations must not slice ``grid_slice`` again.
+
         Args:
             time_step (jax.Array): Current simulation time step.
             E (jax.Array): Electric field array.
@@ -192,6 +284,8 @@ class Detector(SimulationObject, ABC):
         self,
         state: dict[str, np.ndarray],
         progress: Progress | None = None,
+        cmap: str = "default",
+        aspect: Literal["auto", "equal"] = "equal",
     ) -> dict[str, Figure | str]:
         """Generates plots or videos from recorded detector data.
 
@@ -200,8 +294,13 @@ class Detector(SimulationObject, ABC):
         for time-varying data.
 
         Args:
-            state (dict[str, np.ndarray]): Dictionary containing recorded field data arrays.
-            progress (Progress | None, optional): Optional progress bar for video generation.
+            state: dict[str, np.ndarray]: Dictionary containing recorded field data arrays.
+            progress: Progress | None, optional: Optional progress bar for video generation.
+            cmap: str = "default": Color map for the detector plots. "default" is turbo
+                for unsigned data and RdBu_r for signed data.
+            aspect: Literal["auto", "equal"]: Size aspect of the detector plots.
+                "equal" (default) uses the same scale for all axes.
+                "auto" adjusts each axis's scale to fit the figure size.
 
         Returns:
             dict[str, Figure | str]: Dictionary mapping plot names to either
@@ -209,6 +308,16 @@ class Detector(SimulationObject, ABC):
         """
         squeezed_arrs = {}
         squeezed_ndim = None
+
+        # Resolve cmap
+        if cmap == "default":
+            if self._signed_data:
+                resolved_cmap = "RdBu_r"
+            else:
+                resolved_cmap = "turbo"
+        else:
+            resolved_cmap = cmap
+
         for k, v in state.items():
             v_squeezed = v.squeeze()
             if self.inverse and self.if_inverse_plot_backwards and self.num_time_steps_recorded > 1:
@@ -232,17 +341,20 @@ class Detector(SimulationObject, ABC):
                 fig = plot_line_over_time(arr=v, time_steps=time_steps.tolist(), metric_name=f"{self.name}: {k}")
                 figs[k] = fig
         elif squeezed_ndim == 1 and self.num_time_steps_recorded == 1:
-            SCALE = 10
             xlabel = None
+            spatial_axis = None
             if self.grid_shape[0] > 1 and self.grid_shape[1] <= 1 and self.grid_shape[2] <= 1:
                 xlabel = "X axis (μm)"
+                spatial_axis = self._plot_axis_centers_um(0)
             elif self.grid_shape[0] <= 1 and self.grid_shape[1] > 1 and self.grid_shape[2] <= 1:
                 xlabel = "Y axis (μm)"
+                spatial_axis = self._plot_axis_centers_um(1)
             elif self.grid_shape[0] <= 1 and self.grid_shape[1] <= 1 and self.grid_shape[2] > 1:
                 xlabel = "Z axis (μm)"
+                spatial_axis = self._plot_axis_centers_um(2)
             assert xlabel is not None, "This should never happen"
+            assert spatial_axis is not None, "This should never happen"
             for k, v in squeezed_arrs.items():
-                spatial_axis = np.arange(len(v)) / SCALE
                 fig = plot_line_over_time(
                     arr=v, time_steps=spatial_axis, metric_name=f"{self.name}: {k}", xlabel=xlabel
                 )
@@ -252,9 +364,6 @@ class Detector(SimulationObject, ABC):
             time_steps = np.where(np.asarray(self._is_on_at_time_step_arr))[0]
             time_steps = time_steps * self._config.time_step_duration
 
-            # Determine spatial axis based on which dimension has size > 1
-            SCALE = 10  # μm per grid point
-
             for k, v in squeezed_arrs.items():
                 # Determine which dimension is spatial (not time)
                 spatial_dim = 1 if v.shape[1] > 1 else 0
@@ -262,8 +371,10 @@ class Detector(SimulationObject, ABC):
                     # Transpose if needed so time is always first dimension
                     v = v.T
 
-                # Create spatial axis in μm
-                spatial_points = np.arange(v.shape[1]) / SCALE
+                active_axes = [axis for axis, size in enumerate(self.grid_shape) if size > 1]
+                if len(active_axes) != 1:
+                    raise Exception(f"Cannot infer one spatial plotting axis for grid shape {self.grid_shape}")
+                spatial_points = self._plot_axis_centers_um(active_axes[0])
 
                 fig = plot_waterfall_over_time(
                     arr=v,
@@ -280,13 +391,13 @@ class Detector(SimulationObject, ABC):
                     xy_slice=squeezed_arrs["XY Plane"],
                     xz_slice=squeezed_arrs["XZ Plane"],
                     yz_slice=squeezed_arrs["YZ Plane"],
-                    resolutions=(
-                        self._config.resolution,
-                        self._config.resolution,
-                        self._config.resolution,
-                    ),
+                    resolutions=self._plot_resolutions(),
+                    coordinate_edges_um=self._plot_coordinate_edges_um(),
                     plot_dpi=self.plot_dpi,
                     plot_interpolation=self.plot_interpolation,
+                    aspect=aspect,
+                    cmap=resolved_cmap,
+                    signed_data=self._signed_data,
                 )
                 figs["sliced_plot"] = fig
             else:
@@ -301,13 +412,13 @@ class Detector(SimulationObject, ABC):
                     yz_slice=squeezed_arrs["YZ Plane"],
                     progress=progress,
                     num_worker=self.num_video_workers,
-                    resolutions=(
-                        self._config.resolution,
-                        self._config.resolution,
-                        self._config.resolution,
-                    ),
+                    resolutions=self._plot_resolutions(),
+                    coordinate_edges_um=self._plot_coordinate_edges_um(),
                     plot_dpi=self.plot_dpi,
                     plot_interpolation=self.plot_interpolation,
+                    aspect=aspect,
+                    cmap=resolved_cmap,
+                    signed_data=self._signed_data,
                 )
                 figs["sliced_video"] = path
             else:
@@ -325,13 +436,13 @@ class Detector(SimulationObject, ABC):
                     xy_slice=xy_slice,
                     xz_slice=xz_slice,
                     yz_slice=yz_slice,
-                    resolutions=(
-                        self._config.resolution,
-                        self._config.resolution,
-                        self._config.resolution,
-                    ),
+                    resolutions=self._plot_resolutions(),
+                    coordinate_edges_um=self._plot_coordinate_edges_um(),
                     plot_dpi=self.plot_dpi,
                     plot_interpolation=self.plot_interpolation,
+                    aspect=aspect,
+                    cmap=resolved_cmap,
+                    signed_data=self._signed_data,
                 )
                 figs[k] = fig
         elif squeezed_ndim == 4 and self.num_time_steps_recorded > 1:
@@ -347,13 +458,13 @@ class Detector(SimulationObject, ABC):
                     yz_slice=yz_slice,
                     progress=progress,
                     num_worker=self.num_video_workers,
-                    resolutions=(
-                        self._config.resolution,
-                        self._config.resolution,
-                        self._config.resolution,
-                    ),
+                    resolutions=self._plot_resolutions(),
+                    coordinate_edges_um=self._plot_coordinate_edges_um(),
                     plot_dpi=self.plot_dpi,
                     plot_interpolation=self.plot_interpolation,
+                    aspect=aspect,
+                    cmap=resolved_cmap,
+                    signed_data=self._signed_data,
                 )
                 figs[k] = path
         else:

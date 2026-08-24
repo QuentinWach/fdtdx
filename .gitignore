@@ -2,7 +2,6 @@ multirun
 outputs
 tmp
 slurm-*
-uv.lock
 .jax_cache
 .vscode
 .pytest_cache
@@ -20,6 +19,7 @@ docs/source/notebooks
 docs/source/api
 docs/jupyter_execute
 tests/generated/
+scripts/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
@@ -91,9 +91,6 @@ target/
 
 # IPython Notebook
 .ipynb_checkpoints
-
-# pyenv
-.python-version
 
 # celery beat schedule file
 celerybeat-schedule

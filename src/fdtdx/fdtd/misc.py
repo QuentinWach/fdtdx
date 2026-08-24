@@ -1,6 +1,7 @@
 from typing import Sequence
 
 import jax
+import jax.numpy as jnp
 
 from fdtdx.fdtd.container import ArrayContainer
 from fdtdx.objects.boundaries.perfectly_matched_layer import PerfectlyMatchedLayer
@@ -27,7 +28,7 @@ def collect_boundary_interfaces(
     """
     res = {}
     for field_str in fields_to_collect:
-        arr: jax.Array = getattr(arrays, field_str)
+        arr: jax.Array = getattr(arrays.fields, field_str)
         for pml in pml_objects:
             cur_slice = arr[:, *pml.interface_slice()]
             res[f"{pml.name}_{field_str}"] = cur_slice
@@ -55,16 +56,158 @@ def add_boundary_interfaces(
     Returns:
         ArrayContainer: Updated ArrayContainer with restored interface field values
     """
-    updated_dict = {}
     for field_str in fields_to_add:
-        arr: jax.Array = getattr(arrays, field_str)
+        arr: jax.Array = getattr(arrays.fields, field_str)
         for pml in pml_objects:
             val = values[f"{pml.name}_{field_str}"]
-            grid_slice = pml.interface_slice()
-            arr = arr.at[:, *grid_slice].set(val)
-        updated_dict[field_str] = arr
-
-    for k, v in updated_dict.items():
-        arrays = arrays.at[k].set(v)
+            arr = arr.at[:, *pml.interface_slice()].set(val)
+        arrays = arrays.aset(f"fields->{field_str}", arr)
 
     return arrays
+
+
+def compute_anisotropic_update_matrices(
+    inv_material_prop: jax.Array,
+    sigma: jax.Array | None,
+    c: float,
+    eta_factor: float,
+) -> tuple[jax.Array, jax.Array]:
+    """Computes the A and B matrices for anisotropic FDTD updates.
+
+    Args:
+        inv_material_prop (jax.Array): Inverse material property tensor (3, 3, Nx, Ny, Nz)
+        sigma (jax.Array | None): Conductivity tensor (3, 3, Nx, Ny, Nz) or None
+        c (float): Courant number
+        eta_factor (float): eta0 for electric, 1/eta0 for magnetic
+
+    Returns:
+        tuple[jax.Array, jax.Array]: A and B matrices
+    """
+
+    M1 = jnp.eye(3)[:, :, None, None, None]
+    M2 = jnp.eye(3)[:, :, None, None, None]
+    if sigma is not None:
+        factor = c * eta_factor / 2 * jnp.einsum("ijxyz,jkxyz->ikxyz", inv_material_prop, sigma)
+        M1 += factor
+        M2 -= factor
+    perm = (2, 3, 4, 0, 1)  # (3, 3, Nx, Ny, Nz) -> (Nx, Ny, Nz, 3, 3)
+    inv_perm = (3, 4, 0, 1, 2)  # (Nx, Ny, Nz, 3, 3) -> (3, 3, Nx, Ny, Nz)
+    A = jnp.linalg.solve(M1.transpose(perm), M2.transpose(perm)).transpose(inv_perm)
+    B = c * jnp.linalg.solve(M1.transpose(perm), inv_material_prop.transpose(perm)).transpose(inv_perm)
+
+    return A, B
+
+
+def compute_anisotropic_update_matrices_reverse(
+    inv_material_prop: jax.Array,
+    sigma: jax.Array | None,
+    c: float,
+    eta_factor: float,
+) -> tuple[jax.Array, jax.Array]:
+    """Computes the A and B matrices for reverse anisotropic FDTD updates.
+
+    Args:
+        inv_material_prop (jax.Array): Inverse material property tensor (3, 3, Nx, Ny, Nz)
+        sigma (jax.Array | None): Conductivity tensor (3, 3, Nx, Ny, Nz) or None
+        c (float): Courant number
+        eta_factor (float): eta0 for electric, 1/eta0 for magnetic
+
+    Returns:
+        tuple[jax.Array, jax.Array]: A and B matrices
+    """
+    M1 = jnp.eye(3)[:, :, None, None, None]
+    M2 = jnp.eye(3)[:, :, None, None, None]
+    if sigma is not None:
+        factor = c * eta_factor / 2 * jnp.einsum("ijxyz,jkxyz->ikxyz", inv_material_prop, sigma)
+        M1 += factor
+        M2 -= factor
+    perm = (2, 3, 4, 0, 1)  # (3, 3, Nx, Ny, Nz) -> (Nx, Ny, Nz, 3, 3)
+    inv_perm = (3, 4, 0, 1, 2)  # (Nx, Ny, Nz, 3, 3) -> (3, 3, Nx, Ny, Nz)
+    A = jnp.linalg.solve(M2.transpose(perm), M1.transpose(perm)).transpose(inv_perm)
+    B = c * jnp.linalg.solve(M2.transpose(perm), inv_material_prop.transpose(perm)).transpose(inv_perm)
+
+    return A, B
+
+
+def avg_anisotropic_E_component(
+    field: jax.Array,
+    component: int,
+    location: int,
+    aniso_widths: tuple[jax.Array, jax.Array, jax.Array] | None = None,
+) -> jax.Array:
+    """Averages an E field component onto another component's Yee location.
+
+    On a uniform grid this is the four-point mean of the staggered samples. On a non-uniform
+    grid the center-to-edge half-step along the component axis is weighted by the local cell
+    widths; the location axis is already edge-aligned and keeps an unweighted midpoint.
+
+    Args:
+        field (jax.Array): E field to average (3, Nx, Ny, Nz)
+        component (int): Component to average, 0 for Ex, 1 for Ey, 2 for Ez
+        location (int): Location to calculate average, 0 for Ex, 1 for Ey, 2 for Ez
+        aniso_widths (tuple | None): Per-axis padded cell widths from
+            ``get_anisotropic_averaging_widths``, broadcast along their axis, or None on a
+            uniform grid. None (the default) selects the unweighted four-point mean.
+
+    Returns:
+        jax.Array: Averaged E field component
+    """
+
+    samples = field[component]
+    if aniso_widths is None:
+        return (
+            (
+                samples
+                + jnp.roll(samples, -1, axis=location)
+                + jnp.roll(samples, 1, axis=component)
+                + jnp.roll(samples, (-1, 1), axis=(location, component))
+            )
+            / 4
+        )[1:-1, 1:-1, 1:-1]
+    centered = 0.5 * (samples + jnp.roll(samples, -1, axis=location))
+    width = aniso_widths[component]
+    previous_width = jnp.roll(width, 1, axis=component)
+    on_edge = (centered * previous_width + jnp.roll(centered, 1, axis=component) * width) / (width + previous_width)
+    return on_edge[1:-1, 1:-1, 1:-1]
+
+
+def avg_anisotropic_H_component(
+    field: jax.Array,
+    component: int,
+    location: int,
+    aniso_widths: tuple[jax.Array, jax.Array, jax.Array] | None = None,
+) -> jax.Array:
+    """Averages an H field component onto another component's Yee location.
+
+    On a uniform grid this is the four-point mean of the staggered samples. On a non-uniform
+    grid the center-to-edge half-step along the location axis is weighted by the local cell
+    widths; the component axis is already edge-aligned and keeps an unweighted midpoint.
+
+    Args:
+        field (jax.Array): H field to average (3, Nx, Ny, Nz)
+        component (int): Component to average, 0 for Hx, 1 for Hy, 2 for Hz
+        location (int): Location to calculate average, 0 for Hx, 1 for Hy, 2 for Hz
+        aniso_widths (tuple | None): Per-axis padded cell widths from
+            ``get_anisotropic_averaging_widths``, broadcast along their axis, or None on a
+            uniform grid. None (the default) selects the unweighted four-point mean.
+
+    Returns:
+        jax.Array: Averaged H field component
+    """
+
+    samples = field[component]
+    if aniso_widths is None:
+        return (
+            (
+                samples
+                + jnp.roll(samples, 1, axis=location)
+                + jnp.roll(samples, -1, axis=component)
+                + jnp.roll(samples, (1, -1), axis=(location, component))
+            )
+            / 4
+        )[1:-1, 1:-1, 1:-1]
+    width = aniso_widths[location]
+    previous_width = jnp.roll(width, 1, axis=location)
+    on_edge = (samples * previous_width + jnp.roll(samples, 1, axis=location) * width) / (width + previous_width)
+    centered = 0.5 * (on_edge + jnp.roll(on_edge, -1, axis=component))
+    return centered[1:-1, 1:-1, 1:-1]

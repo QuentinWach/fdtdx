@@ -1,3 +1,6 @@
+from __future__ import annotations
+
+from collections.abc import Callable
 from functools import partial
 
 import equinox.internal as eqxi
@@ -5,12 +8,32 @@ import jax
 import jax.numpy as jnp
 
 from fdtdx.config import SimulationConfig
+from fdtdx.core.progress import _make_pbar, _wrap_body_with_progress
 from fdtdx.fdtd.backward import backward
-from fdtdx.fdtd.container import ArrayContainer, ObjectContainer, SimulationState, reset_array_container
+from fdtdx.fdtd.container import ArrayContainer, FieldState, ObjectContainer, PmlAuxField, SimulationState
 from fdtdx.fdtd.forward import forward, forward_single_args_wrapper
 from fdtdx.fdtd.stop_conditions import StoppingCondition, TimeStepCondition
 from fdtdx.interfaces.state import RecordingState
 from fdtdx.objects.detectors.detector import DetectorState
+
+
+def _reversible_slice_boundaries(time_steps_total: int, num_slices: int) -> list[int]:
+    """Compute the time-step boundaries partitioning a run into ``num_slices`` slices.
+
+    Returns ``[s_0, s_1, ..., s_k]`` with ``k = num_slices``, ``s_0 = 0`` and
+    ``s_k = time_steps_total``. The boundaries are strictly increasing and every slice
+    ``[s_i, s_{i+1}]`` has length ``>= 1`` provided ``1 <= num_slices <= time_steps_total``.
+    The interior boundaries ``s_1 .. s_{k-1}`` are the times at which a full-field checkpoint
+    is taken for the sliced reversible backward pass.
+
+    Args:
+        time_steps_total (int): Total number of forward time steps ``T``.
+        num_slices (int): Number of slices ``k`` (``= num_checkpoints_reversible + 1``).
+
+    Returns:
+        list[int]: The ``num_slices + 1`` boundary time steps.
+    """
+    return [round(i * time_steps_total / num_slices) for i in range(num_slices + 1)]
 
 
 def reversible_fdtd(
@@ -18,6 +41,8 @@ def reversible_fdtd(
     objects: ObjectContainer,
     config: SimulationConfig,
     key: jax.Array,
+    show_progress: bool = True,
+    progress_callback: Callable[[int, int], None] | None = None,
 ) -> SimulationState:
     """Run a memory-efficient differentiable FDTD simulation leveraging time-reversal symmetry.
 
@@ -41,6 +66,12 @@ def reversible_fdtd(
             - time_steps_total: Total number of steps to simulate
             - invertible_optimization: Whether to record boundaries for backprop
         key (jax.Array): JAX PRNGKey for any stochastic operations
+        show_progress (bool): Display a tqdm progress bar while the simulation runs.
+            Set to False for a minor speed improvement; see the module-level
+            benchmark note for overhead estimates. Defaults to True.
+            The bar is driven entirely by ``io_callback`` at XLA execution
+            time, so it works correctly whether the simulation is
+            wrapped in ``jax.jit``.
 
     Returns:
         SimulationState: Tuple containing:
@@ -52,74 +83,129 @@ def reversible_fdtd(
         efficient backpropagation through the entire simulation while maintaining
         numerical stability. This makes it suitable for gradient-based optimization
         of electromagnetic designs.
+
+    Raises:
+        NotImplementedError: If the simulation contains dispersive materials. Reversing
+            the ADE polarization recurrence is not supported; use the ``"checkpointed"``
+            gradient method for dispersive simulations.
     """
     # if arrays.magnetic_conductivity is not None or arrays.electric_conductivity is not None:
     #     raise Exception(f"Reversible FDTD does not work with Conductive Materials")
-    arrays = reset_array_container(
-        arrays,
-        objects,
+
+    # Checked here in addition to initialization time, since the gradient config can be
+    # swapped after ``place_objects`` and this function can be called directly, bypassing
+    # ``run_fdtd``.
+    if arrays.dispersive_c1 is not None or arrays.fields.dispersive_P_curr is not None:
+        raise NotImplementedError(
+            "Dispersive time-reversible gradient computation under active development. "
+            "Use GradientConfig(method='checkpointed') instead."
+        )
+
+    arrays = arrays.reset()
+
+    # Sliced reversible backward pass: partition the run into ``num_slices`` slices and store a
+    # full-field checkpoint at each interior boundary during the forward pass, so the reverse
+    # reconstruction can be reset to the exact field at every boundary (bounding reconstruction
+    # drift for lossy materials). ``num_checkpoints_reversible == 0`` (the default)
+    # gives a single slice and reproduces the classic full reverse pass exactly.
+    num_ckpt = 0 if config.gradient_config is None else config.gradient_config.num_checkpoints_reversible
+    num_slices = num_ckpt + 1
+    # Only the interior checkpoints (num_ckpt >= 1) impose the slice-length constraint; the default
+    # single slice (num_ckpt == 0) is always valid, including the ``time_steps_total == 0`` edge case.
+    if num_ckpt > 0 and num_slices > config.time_steps_total:
+        raise Exception(
+            "num_checkpoints_reversible must be <= time_steps_total - 1 "
+            f"(got num_checkpoints_reversible={num_ckpt}, time_steps_total={config.time_steps_total})"
+        )
+    slice_boundaries = _reversible_slice_boundaries(config.time_steps_total, num_slices)
+    checkpoint_times = slice_boundaries[1:-1]  # interior boundaries s_1 .. s_{k-1}
+
+    pbar = _make_pbar(
+        show_progress=show_progress,
+        total_steps=config.time_steps_total,
+        desc="FDTD (reversible)",
+        progress_callback=progress_callback,
     )
+
+    # Build the (optionally instrumented) forward body function once so both
+    # reversible_fdtd_base and fdtd_bwd share the same wrapping logic.
+    _forward_body = partial(
+        forward,
+        config=config,
+        objects=objects,
+        key=key,
+        record_detectors=True,
+        record_boundaries=config.invertible_optimization,
+        simulate_boundaries=True,
+    )
+    _forward_body_with_progress, _close_pbar = _wrap_body_with_progress(_forward_body, pbar)
+
+    def segmented_forward(
+        arr: ArrayContainer,
+    ) -> tuple[SimulationState, list[FieldState]]:
+        """Run the forward pass in ``num_slices`` consecutive segments, capturing checkpoints.
+
+        This is the single source of truth for the reversible forward stepping. After each of the
+        first ``num_slices - 1`` segments the current full ``FieldState`` at the interior boundary
+        ``s_i`` is captured. For a single slice (``num_slices == 1``) this runs exactly one
+        while-loop over ``[0, time_steps_total]`` and returns an empty checkpoint list.
+        """
+        state = (jnp.asarray(0, dtype=jnp.int32), arr)
+        checkpoints: list[FieldState] = []
+        for seg in range(num_slices):
+            hi = slice_boundaries[seg + 1]
+            state = eqxi.while_loop(
+                max_steps=hi - slice_boundaries[seg],
+                cond_fun=lambda s, _hi=hi: _hi > s[0],
+                body_fun=_forward_body_with_progress,
+                init_val=state,
+                kind="lax",
+            )
+            if seg < num_slices - 1:
+                checkpoints.append(state[1].fields)
+        return (state[0], state[1]), checkpoints
 
     def reversible_fdtd_base(
         arr: ArrayContainer,
     ) -> SimulationState:
-        state = (jnp.asarray(0, dtype=jnp.int32), arr)
-        state = eqxi.while_loop(
-            max_steps=config.time_steps_total,
-            cond_fun=lambda s: config.time_steps_total > s[0],
-            body_fun=partial(
-                forward,
-                config=config,
-                objects=objects,
-                key=key,
-                record_detectors=True,
-                record_boundaries=config.invertible_optimization,
-                simulate_boundaries=True,
-            ),
-            init_val=state,
-            kind="lax",
-        )
-        return (state[0], state[1])
+        # Delegates to segmented_forward (single source of truth for the forward stepping) and
+        # discards the checkpoints - the non-gradient primal path needs only the final state.
+        state, _ = segmented_forward(arr)
+        return state
 
     @jax.custom_vjp
     def reversible_fdtd_primal(
         E: jax.Array,
         H: jax.Array,
-        psi_E: jax.Array,
-        psi_H: jax.Array,
-        alpha: jax.Array,
-        kappa: jax.Array,
-        sigma: jax.Array,
+        psi_E: PmlAuxField,
+        psi_H: PmlAuxField,
         inv_permittivities: jax.Array,
         inv_permeabilities: jax.Array,
         detector_states: dict[str, DetectorState],
         recording_state: RecordingState | None,
     ):
         arr = ArrayContainer(
-            E=E,
-            H=H,
-            psi_E=psi_E,
-            psi_H=psi_H,
-            alpha=alpha,
-            kappa=kappa,
-            sigma=sigma,
+            fields=FieldState(
+                E=E,
+                H=H,
+                psi_E=psi_E,
+                psi_H=psi_H,
+            ),
             inv_permittivities=inv_permittivities,
             inv_permeabilities=inv_permeabilities,
             detector_states=detector_states,
             recording_state=recording_state,
             electric_conductivity=arrays.electric_conductivity,
             magnetic_conductivity=arrays.magnetic_conductivity,
+            initial_inv_permittivities=arrays.initial_inv_permittivities,
         )
         state = reversible_fdtd_base(arr)
         return (
             state[0],
-            state[1].E,
-            state[1].H,
-            state[1].psi_E,
-            state[1].psi_H,
-            state[1].alpha,
-            state[1].kappa,
-            state[1].sigma,
+            state[1].fields.E,
+            state[1].fields.H,
+            state[1].fields.psi_E,
+            state[1].fields.psi_H,
             state[1].inv_permittivities,
             state[1].inv_permeabilities,
             state[1].detector_states,
@@ -147,15 +233,14 @@ def reversible_fdtd(
                 record_detectors=True,
                 record_boundaries=False,
                 simulate_boundaries=True,
+                electric_conductivity=arrays.electric_conductivity,
+                magnetic_conductivity=arrays.magnetic_conductivity,
             ),
             state[0],
-            state[1].E,
-            state[1].H,
-            state[1].psi_E,
-            state[1].psi_H,
-            state[1].alpha,
-            state[1].kappa,
-            state[1].sigma,
+            state[1].fields.E,
+            state[1].fields.H,
+            state[1].fields.psi_E,
+            state[1].fields.psi_H,
             state[1].inv_permittivities,
             state[1].inv_permeabilities,
             state[1].detector_states,
@@ -178,115 +263,117 @@ def reversible_fdtd(
         residual,
         cot,
     ):
+        primal_out, checkpoints = residual
         (
             res_time_step,
             res_E,
             res_H,
             res_psi_E,
             res_psi_H,
-            res_alpha,
-            res_kappa,
-            res_sigma,
             res_inv_permittivities,
             res_inv_permeabilities,
             res_detector_states,
             res_recording_state,
-        ) = residual
+        ) = primal_out
 
         s_k = ArrayContainer(
-            E=res_E,
-            H=res_H,
-            psi_E=res_psi_E,
-            psi_H=res_psi_H,
-            alpha=res_alpha,
-            kappa=res_kappa,
-            sigma=res_sigma,
+            fields=FieldState(
+                E=res_E,
+                H=res_H,
+                psi_E=res_psi_E,
+                psi_H=res_psi_H,
+            ),
             inv_permittivities=res_inv_permittivities,
             inv_permeabilities=res_inv_permeabilities,
             detector_states=res_detector_states,
             recording_state=res_recording_state,
             electric_conductivity=arrays.electric_conductivity,
             magnetic_conductivity=arrays.magnetic_conductivity,
+            initial_inv_permittivities=arrays.initial_inv_permittivities,
         )
+
+        # For a single slice ``checkpoints`` is empty and the reverse loop runs the unmodified
+        # ``body_fn`` (bit-identical to the classic full reverse pass). Otherwise, wrap ``body_fn``
+        # so that at each interior boundary ``s_i`` the reconstructed primal field is reset to the
+        # exact stored checkpoint before the reverse step, bounding reconstruction drift. The
+        # cotangent carry is threaded through untouched, keeping the field adjoint continuous.
+        if checkpoints:
+
+            def reverse_body(sr_tuple):
+                state, running_cot = sr_tuple
+                time_step, arrs = state
+                for ckpt_fields, s_i in zip(checkpoints, checkpoint_times):
+                    cur_fields = arrs.fields
+                    new_fields = jax.lax.cond(
+                        time_step == s_i,
+                        lambda cf=ckpt_fields: cf,
+                        lambda cf=cur_fields: cf,
+                    )
+                    arrs = arrs.aset("fields", new_fields)
+                return body_fn(((time_step, arrs), running_cot))
+
+        else:
+            reverse_body = body_fn
 
         _, cot = eqxi.while_loop(
             cond_fun=partial(cond_fun, start_time_step=0),
-            body_fun=body_fn,
+            body_fun=reverse_body,
             init_val=((res_time_step, s_k), cot),
             kind="lax",
         )
         return (
-            None,  # cot[1],
-            None,  # cot[2],
-            None,  # cot[3],
-            None,  # cot[4],
-            None,  # cot[5],
-            None,  # cot[6],
-            None,  # cot[7],
-            cot[8],
-            cot[9],
-            None,  # cot[10],
-            None,  # cot[11],
+            None,  # cot[1],   E
+            None,  # cot[2],   H
+            None,  # cot[3],   psi_E
+            None,  # cot[4],   psi_H
+            cot[5],  #         inv_permittivities
+            cot[6],  #         inv_permeabilities
+            None,  # cot[7],   detector_states
+            None,  # cot[8],   recording_state
         )
 
     def fdtd_fwd(
         E: jax.Array,
         H: jax.Array,
-        psi_E: jax.Array,
-        psi_H: jax.Array,
-        alpha: jax.Array,
-        kappa: jax.Array,
-        sigma: jax.Array,
+        psi_E: PmlAuxField,
+        psi_H: PmlAuxField,
         inv_permittivities: jax.Array,
         inv_permeabilities: jax.Array,
         detector_states: dict[str, DetectorState],
         recording_state: RecordingState | None,
     ):
         arr = ArrayContainer(
-            E=E,
-            H=H,
-            psi_E=psi_E,
-            psi_H=psi_H,
-            alpha=alpha,
-            kappa=kappa,
-            sigma=sigma,
+            fields=FieldState(
+                E=E,
+                H=H,
+                psi_E=psi_E,
+                psi_H=psi_H,
+            ),
             inv_permittivities=inv_permittivities,
             inv_permeabilities=inv_permeabilities,
             detector_states=detector_states,
             recording_state=recording_state,
             electric_conductivity=arrays.electric_conductivity,
             magnetic_conductivity=arrays.magnetic_conductivity,
+            initial_inv_permittivities=arrays.initial_inv_permittivities,
         )
-        s_k = reversible_fdtd_base(arr)
+        s_k, checkpoints = segmented_forward(arr)
 
         primal_out = (
             s_k[0],
-            s_k[1].E,
-            s_k[1].H,
-            s_k[1].psi_E,
-            s_k[1].psi_H,
-            s_k[1].alpha,
-            s_k[1].kappa,
-            s_k[1].sigma,
+            s_k[1].fields.E,
+            s_k[1].fields.H,
+            s_k[1].fields.psi_E,
+            s_k[1].fields.psi_H,
             s_k[1].inv_permittivities,
             s_k[1].inv_permeabilities,
             s_k[1].detector_states,
             s_k[1].recording_state,  # None
         )
-        residual = (
-            s_k[0],
-            s_k[1].E,
-            s_k[1].H,
-            s_k[1].psi_E,
-            s_k[1].psi_H,
-            s_k[1].alpha,
-            s_k[1].kappa,
-            s_k[1].sigma,
-            s_k[1].inv_permittivities,
-            s_k[1].inv_permeabilities,
-            s_k[1].detector_states,
-            s_k[1].recording_state,
-        )
+        # ``checkpoints`` holds the interior full-field snapshots (empty for a single slice); they
+        # are threaded to ``fdtd_bwd`` via the residual so the reverse reconstruction can be reset
+        # to the exact field at each boundary.
+        residual = (primal_out, checkpoints)
         return primal_out, residual
 
     reversible_fdtd_primal.defvjp(fdtd_fwd, fdtd_bwd)
@@ -297,40 +384,36 @@ def reversible_fdtd(
         H,
         psi_E,
         psi_H,
-        alpha,
-        kappa,
-        sigma,
         inv_permittivities,
         inv_permeabilities,
         detector_states,
         recording_state,
     ) = reversible_fdtd_primal(
-        E=arrays.E,
-        H=arrays.H,
-        psi_E=arrays.psi_E,
-        psi_H=arrays.psi_H,
-        alpha=arrays.alpha,
-        kappa=arrays.kappa,
-        sigma=arrays.sigma,
+        E=arrays.fields.E,
+        H=arrays.fields.H,
+        psi_E=arrays.fields.psi_E,
+        psi_H=arrays.fields.psi_H,
         inv_permittivities=arrays.inv_permittivities,
         inv_permeabilities=arrays.inv_permeabilities,
         detector_states=arrays.detector_states,
         recording_state=arrays.recording_state,
     )
+    _close_pbar()
+
     out_arrs = ArrayContainer(
-        E=E,
-        H=H,
-        psi_E=psi_E,
-        psi_H=psi_H,
-        alpha=alpha,
-        kappa=kappa,
-        sigma=sigma,
+        fields=FieldState(
+            E=E,
+            H=H,
+            psi_E=psi_E,
+            psi_H=psi_H,
+        ),
         inv_permittivities=inv_permittivities,
         inv_permeabilities=inv_permeabilities,
         detector_states=detector_states,
         recording_state=recording_state,
         electric_conductivity=arrays.electric_conductivity,
         magnetic_conductivity=arrays.magnetic_conductivity,
+        initial_inv_permittivities=arrays.initial_inv_permittivities,
     )
     return time_step, out_arrs
 
@@ -341,6 +424,8 @@ def checkpointed_fdtd(
     config: SimulationConfig,
     key: jax.Array,
     stopping_condition: StoppingCondition | None = None,
+    show_progress: bool = True,
+    progress_callback: Callable[[int, int], None] | None = None,
 ) -> SimulationState:
     """Run an FDTD simulation with gradient checkpointing for memory efficiency.
 
@@ -355,6 +440,12 @@ def checkpointed_fdtd(
         key (jax.Array): JAX PRNGKey for any stochastic operations
         stopping_condition (StoppingCondition, optional): Custom stopping condition on which simulation is halted.
             If none is provided, we default to TimeStepCondition (simulation progresses until max time is reached)
+        show_progress (bool): Display a tqdm progress bar while the simulation runs.
+            Set to False for a minor speed improvement; see the module-level
+            benchmark note for overhead estimates. Defaults to True.
+            The bar is driven entirely by ``io_callback`` at XLA execution
+            time, so it works correctly whether the simulation is
+            wrapped in ``jax.jit``.
 
     Returns:
         SimulationState: Tuple containing final time step and ArrayContainer with final state
@@ -363,12 +454,31 @@ def checkpointed_fdtd(
         The number of checkpoints can be configured through config.gradient_config.num_checkpoints.
         More checkpoints reduce recomputation but increase memory usage.
     """
-    arrays = reset_array_container(arrays, objects)
+    arrays = arrays.reset()
     state = (jnp.asarray(0, dtype=jnp.int32), arrays)
     if stopping_condition is not None:
         stopping_condition = stopping_condition.setup(state, config, objects)
     else:
         stopping_condition = TimeStepCondition().setup(state, config, objects)
+
+    pbar = _make_pbar(
+        show_progress=show_progress,
+        total_steps=config.time_steps_total,
+        desc="FDTD (checkpointed)",
+        progress_callback=progress_callback,
+    )
+
+    _forward_body = partial(
+        forward,
+        config=config,
+        objects=objects,
+        key=key,
+        record_detectors=True,
+        record_boundaries=config.invertible_optimization,
+        simulate_boundaries=True,
+    )
+    _forward_body_with_progress, _close_pbar = _wrap_body_with_progress(_forward_body, pbar)
+
     state = eqxi.while_loop(
         max_steps=config.time_steps_total,
         cond_fun=partial(
@@ -376,19 +486,12 @@ def checkpointed_fdtd(
             config=config,
             objects=objects,
         ),
-        body_fun=partial(
-            forward,
-            config=config,
-            objects=objects,
-            key=key,
-            record_detectors=True,
-            record_boundaries=config.invertible_optimization,
-            simulate_boundaries=True,
-        ),
+        body_fun=_forward_body_with_progress,
         init_val=state,
         kind="lax" if config.only_forward is None else "checkpointed",
         checkpoints=(None if config.gradient_config is None else config.gradient_config.num_checkpoints),
     )
+    _close_pbar()
 
     return state
 
@@ -402,6 +505,8 @@ def custom_fdtd_forward(
     record_detectors: bool,
     start_time: int | jax.Array,
     end_time: int | jax.Array,
+    show_progress: bool = True,
+    progress_callback: Callable[[int, int], None] | None = None,
 ) -> SimulationState:
     """Run a customizable forward FDTD simulation between specified time steps.
 
@@ -417,6 +522,12 @@ def custom_fdtd_forward(
         record_detectors (bool): Whether to record detector readings
         start_time (int | jax.Array): Time step to start from
         end_time (int | jax.Array): Time step to end at
+        show_progress (bool): Display a tqdm progress bar while the simulation runs.
+            Set to False for a minor speed improvement; see the module-level
+            benchmark note for overhead estimates. Defaults to True.
+            The bar is driven entirely by ``io_callback`` at XLA execution
+            time, so it works correctly whether the simulation is
+            wrapped in ``jax.jit``.
 
     Returns:
         SimulationState: Tuple containing final time step and ArrayContainer with final state
@@ -426,23 +537,48 @@ def custom_fdtd_forward(
         running partial simulations for analysis purposes.
     """
     if reset_container:
-        arrays = reset_array_container(arrays, objects)
+        arrays = arrays.reset()
     state = (jnp.asarray(start_time, dtype=jnp.int32), arrays)
+
+    # start_time and end_time must be statically known Python ints here so that
+    # we can compute n_steps for the progress bar without triggering JAX
+    # concretization.  They are always statically known at call sites of this
+    # function (they control the loop bound, not an array value).
+    if isinstance(start_time, jax.Array) or isinstance(end_time, jax.Array):
+        # Traced arrays: skip the progress bar entirely to avoid concretization.
+        show_progress = False
+        progress_callback = None
+        n_steps = 0
+    else:
+        n_steps = int(end_time) - int(start_time)
+
+    pbar = _make_pbar(
+        show_progress=show_progress,
+        total_steps=n_steps,
+        desc="FDTD (forward)",
+        step_offset=0 if not show_progress and progress_callback is None else int(start_time),
+        progress_callback=progress_callback,
+    )
+
+    _forward_body = partial(
+        forward,
+        config=config,
+        objects=objects,
+        key=key,
+        record_detectors=record_detectors,
+        record_boundaries=False,
+        simulate_boundaries=True,
+    )
+    _forward_body_with_progress, _close_pbar = _wrap_body_with_progress(_forward_body, pbar)
+
     state = eqxi.while_loop(
         max_steps=config.time_steps_total,
         cond_fun=lambda s: end_time > s[0],
-        body_fun=partial(
-            forward,
-            config=config,
-            objects=objects,
-            key=key,
-            record_detectors=record_detectors,
-            record_boundaries=False,
-            simulate_boundaries=True,
-        ),
+        body_fun=_forward_body_with_progress,
         init_val=state,
         kind="lax",
         checkpoints=None,
     )
+    _close_pbar()
 
     return state

@@ -4,7 +4,9 @@ import jax
 import jax.numpy as jnp
 
 from fdtdx import constants
+from fdtdx.core.axis import get_transverse_axes
 from fdtdx.core.jax.pytrees import autoinit, frozen_field
+from fdtdx.core.physics.metrics import resample_to_uniform_2d
 from fdtdx.objects.detectors.detector import Detector, DetectorState
 
 
@@ -32,6 +34,33 @@ class DiffractiveDetector(Detector):
     def __post_init__(self):
         if self.dtype not in [jnp.complex64, jnp.complex128]:
             raise Exception(f"Invalid dtype in DiffractiveDetector: {self.dtype}")
+        if len(self.frequencies) == 0:
+            raise ValueError("DiffractiveDetector requires at least one frequency.")
+        if any(f <= 0 for f in self.frequencies):
+            raise ValueError(f"All frequencies must be positive, got: {list(self.frequencies)}")
+        if len(self.orders) == 0:
+            raise ValueError("DiffractiveDetector requires at least one diffraction order.")
+
+    def validate_placement(self, objects) -> list[str]:
+        """Reject a diffractive detector clipped by a symmetry plane.
+
+        The diffraction orders are defined by the plane's periodicity, which the reduction halves.
+        The efficiencies computed on the reduced plane therefore belong to a different order basis
+        than the full-domain ones and are not recoverable afterwards (see
+        :func:`fdtdx.unfold_detector_states`, which raises for the same reason).
+        """
+        errors = list(super().validate_placement(objects))
+        clipped = [a for a in range(3) if self.straddles_symmetry_plane(a)]
+        if clipped:
+            axis_names = ", ".join("xyz"[a] for a in clipped)
+            errors.append(
+                f"DiffractiveDetector '{self.name}' crosses the {axis_names}-symmetry plane. Its "
+                f"diffraction-order basis is set by the plane's period, which config.symmetry halves, so "
+                f"the computed efficiencies would refer to the reduced period rather than the physical "
+                f"one. Run without config.symmetry, or record the fields instead and recompute the "
+                f"orders after fdtdx.unfold_fields."
+            )
+        return errors
 
     @property
     def propagation_axis(self) -> int:
@@ -94,6 +123,25 @@ class DiffractiveDetector(Detector):
     def _num_latent_time_steps(self) -> int:
         return 1
 
+    def _transverse_centers(self, plane_dims: tuple[int, int]) -> tuple[jax.Array, jax.Array] | None:
+        """Return physical transverse cell centers for the detector plane.
+
+        FFT order decomposition requires equally spaced samples.  On rectilinear
+        non-uniform grids, fields are first resampled onto a uniform grid spanning
+        the same detector-center extent.  Uniform grids keep the legacy direct
+        FFT path.
+        """
+        if not self._config.has_nonuniform_grid:
+            return None
+        grid = self._config.resolved_grid
+        assert grid is not None
+        centers = []
+        for axis in plane_dims:
+            lower, upper = self.grid_slice_tuple[axis]
+            centers.append(grid.centers(axis)[lower:upper])
+        c0, c1 = centers
+        return c0, c1
+
     def update(
         self,
         time_step: jax.Array,
@@ -107,20 +155,25 @@ class DiffractiveDetector(Detector):
 
         # Get grid dimensions for the plane perpendicular to propagation axis
         prop_axis = self.propagation_axis
-        plane_dims = [i for i in range(3) if i != prop_axis]
+        plane_dims = get_transverse_axes(prop_axis)
         Nx, Ny = [self.grid_shape[i] for i in plane_dims]
 
-        # Get current field values at the specified plane
-        cur_E = E[:, *self.grid_slice]  # Shape: (3, nx, ny, 1)
-        cur_H = H[:, *self.grid_slice]  # Shape: (3, nx, ny, 1)
-
         # Remove the normal axis dimension since it should be 1
-        cur_E = jnp.squeeze(cur_E, axis=prop_axis + 1)  # Shape: (3, nx, ny)
-        cur_H = jnp.squeeze(cur_H, axis=prop_axis + 1)  # Shape: (3, nx, ny)
+        cur_E = jnp.squeeze(E, axis=prop_axis + 1)  # Shape: (3, nx, ny)
+        cur_H = jnp.squeeze(H, axis=prop_axis + 1)  # Shape: (3, nx, ny)
 
-        # Compute FFT of each field component
-        E_k = jnp.fft.fft2(cur_E, axes=tuple(d + 1 for d in plane_dims))  # FFT in spatial dimensions
-        H_k = jnp.fft.fft2(cur_H, axes=tuple(d + 1 for d in plane_dims))
+        transverse_centers = self._transverse_centers(plane_dims)
+        if transverse_centers is None:
+            dx = dy = self._config.uniform_spacing()
+        else:
+            cur_E, dx, dy = resample_to_uniform_2d(cur_E, transverse_centers[0], transverse_centers[1])
+            cur_H, _, _ = resample_to_uniform_2d(cur_H, transverse_centers[0], transverse_centers[1])
+
+        # Compute FFT of each field component.
+        # After the squeeze, cur_E/cur_H always have shape (3, dim1, dim2), so the
+        # two spatial axes are always 1 and 2 regardless of which axis was squeezed.
+        E_k = jnp.fft.fft2(cur_E, axes=(1, 2))
+        H_k = jnp.fft.fft2(cur_H, axes=(1, 2))
 
         # Convert orders to array for vectorization
         orders = jnp.array(self.orders)  # Shape: (num_orders, 2)
@@ -130,7 +183,6 @@ class DiffractiveDetector(Detector):
         ky_indices = jnp.where(orders[:, 1] >= 0, orders[:, 1], Ny + orders[:, 1])
 
         # Compute wavevectors
-        dx = dy = self._config.resolution
         kx = 2 * jnp.pi * jnp.fft.fftfreq(Nx, dx)
         ky = 2 * jnp.pi * jnp.fft.fftfreq(Ny, dy)
         k0 = 2 * jnp.pi * self.frequencies[0] / constants.c  # Use first frequency for now

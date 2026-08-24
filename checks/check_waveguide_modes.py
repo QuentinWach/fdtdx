@@ -8,6 +8,7 @@ from fdtdx import (
     WaveCharacter,
     Material,
     SimulationConfig,
+    UniformGrid,
     constants,
     ArrayContainer, 
     ParameterContainer, 
@@ -42,7 +43,7 @@ def main():
 
     config = SimulationConfig(
         time=50e-15,
-        resolution=20e-9,
+        grid=UniformGrid(spacing=20e-9),
         dtype=jnp.float32,
         courant_factor=0.99,
     )
@@ -197,7 +198,7 @@ def main():
     
     key, subkey = jax.random.split(key)
     objects, arrays, params, config, _ = place_objects(
-        volume=volume,
+        object_list=[volume],
         config=config,
         constraints=placement_constraints,
         key=subkey,

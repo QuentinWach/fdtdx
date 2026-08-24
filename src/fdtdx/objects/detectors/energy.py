@@ -1,4 +1,7 @@
+from typing import ClassVar
+
 import jax
+import jax.numpy as jnp
 
 from fdtdx.core.jax.pytrees import autoinit, frozen_field
 from fdtdx.core.physics.metrics import compute_energy
@@ -38,6 +41,36 @@ class EnergyDetector(Detector):
     #: If None, mean is used. Defaults to None.
     aggregate: str | None = frozen_field(default=None)  # e.g., "mean"
 
+    # Electromagnetic energy is positive.
+    _signed_data: ClassVar[bool] = False
+
+    def _slice_position_to_index(self, axis: int, real_pos: float | None, axis_len: int) -> int | jax.Array:
+        """Map a requested physical slice position to a local energy index.
+
+        Uniform grids keep the historical origin-plus-spacing conversion.  On a
+        rectilinear grid, slice positions are compared against cell centers in
+        the placed detector interval.  This avoids interpreting physical metres
+        through a single global resolution and makes the selected slice stable
+        under local grid stretching.
+
+        Returns a plain Python int for uniform grids (safe as a static index
+        under jit) and a 0-d JAX array for non-uniform grids (safe as a
+        dynamic index under jit via JAX's dynamic indexing semantics).
+        """
+        if real_pos is None:
+            return axis_len // 2
+        grid = self._config.resolved_grid
+        if grid is not None:
+            start, stop = self.grid_slice_tuple[axis]
+            centers = grid.centers(axis)[start:stop]
+            idx = jnp.clip(jnp.argmin(jnp.abs(centers - real_pos)), 0, axis_len - 1)
+            return idx
+
+        spacing = self._config.uniform_spacing()
+        origin = self.grid_slice[axis].start * spacing
+        idx = int((real_pos - origin) / spacing)
+        return max(0, min(idx, axis_len - 1))
+
     def _shape_dtype_single_time_step(
         self,
     ) -> dict[str, jax.ShapeDtypeStruct]:
@@ -63,19 +96,11 @@ class EnergyDetector(Detector):
         inv_permittivity: jax.Array,
         inv_permeability: jax.Array | float,
     ) -> DetectorState:
-        cur_E = E[:, *self.grid_slice]
-        cur_H = H[:, *self.grid_slice]
-        cur_inv_permittivity = inv_permittivity[:, *self.grid_slice]
-        if isinstance(inv_permeability, jax.Array) and inv_permeability.ndim > 0:
-            cur_inv_permeability = inv_permeability[:, *self.grid_slice]
-        else:
-            cur_inv_permeability = inv_permeability
-
         energy = compute_energy(
-            E=cur_E,
-            H=cur_H,
-            inv_permittivity=cur_inv_permittivity,
-            inv_permeability=cur_inv_permeability,
+            E=E,
+            H=H,
+            inv_permittivity=inv_permittivity,
+            inv_permeability=inv_permeability,
         )
 
         arr_idx = self._time_step_to_arr_idx[time_step]
@@ -90,20 +115,9 @@ class EnergyDetector(Detector):
                 energy_xz = energy.mean(axis=1)
                 energy_yz = energy.mean(axis=0)
             else:
-                # Convert real-world positions to indices
-                origin_x = self.grid_slice[0].start * self._config.resolution
-                origin_y = self.grid_slice[1].start * self._config.resolution
-                origin_z = self.grid_slice[2].start * self._config.resolution
-
-                def to_index(real_pos, origin, axis_len):
-                    if real_pos is not None:
-                        idx = int((real_pos - origin) / self._config.resolution)
-                        return max(0, min(idx, axis_len - 1))
-                    return axis_len // 2
-
-                x_idx = to_index(self.x_slice, origin_x, energy.shape[0])
-                y_idx = to_index(self.y_slice, origin_y, energy.shape[1])
-                z_idx = to_index(self.z_slice, origin_z, energy.shape[2])
+                x_idx = self._slice_position_to_index(0, self.x_slice, energy.shape[0])
+                y_idx = self._slice_position_to_index(1, self.y_slice, energy.shape[1])
+                z_idx = self._slice_position_to_index(2, self.z_slice, energy.shape[2])
 
                 energy_xy = energy[:, :, z_idx]
                 energy_xz = energy[:, y_idx, :]
@@ -120,6 +134,7 @@ class EnergyDetector(Detector):
             }
 
         if self.reduce_volume:
+            energy = energy * self._cell_volume_weights()
             total_energy = energy.sum()
             new_arr = state["energy"].at[arr_idx].set(total_energy)
             return {"energy": new_arr}

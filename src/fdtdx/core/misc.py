@@ -1,13 +1,14 @@
 import itertools
 import math
-from typing import Literal, Sequence
+from typing import Literal, Sequence, overload
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 
+from fdtdx.core.axis import get_oriented_transverse_axes
 from fdtdx.core.jax.pytrees import TreeClass, autoinit, frozen_field
-from fdtdx.core.linalg import get_orthogonal_vector
+from fdtdx.core.linalg import get_orthogonal_vector, get_wave_vector_raw, rotate_vector
 from fdtdx.materials import Material
 
 
@@ -83,6 +84,27 @@ def is_float_divisible(a: float, b: float, tolerance: float = 1e-15) -> bool:
 
     # Check if the remainder is within the tolerance
     return abs(remainder) <= tolerance or abs(remainder - b) <= tolerance
+
+
+def validate_symmetric_axis_cells(n: int, axis_name: str, subject: str = "grid") -> None:
+    """Raise a ``ValueError`` if a symmetric axis has an odd (or < 2) cell count.
+
+    A symmetric axis must split exactly down the middle so the unfolded result matches the full
+    domain cell-for-cell, which requires an even count of at least two.
+
+    Args:
+        n: Number of cells on the axis.
+        axis_name: Axis label used in the error message (e.g. ``"x"``).
+        subject: What is being validated, used in the message (e.g. ``"grid"`` or
+            ``"simulation volume"``).
+    """
+    if n < 2 or n % 2 != 0:
+        raise ValueError(
+            f"Cannot apply symmetry on axis {axis_name}: the {subject} must have an even number of "
+            f"cells (>= 2) on a symmetric axis, got {n}. An even count splits exactly down the middle "
+            f"so the unfolded result matches the full domain cell-for-cell; adjust the size or "
+            f"resolution on axis {axis_name} so it resolves to an even cell count."
+        )
 
 
 def is_index_in_slice(index, slice, seq_length):
@@ -293,7 +315,7 @@ def mask_1d_from_slice(
     """
     start, stop, step = s.indices(axis_size)
     mask = jnp.zeros(shape=(axis_size,), dtype=jnp.bool)
-    mask = mask.at[start:stop:step].set(1)
+    mask = mask.at[start:stop:step].set(True)
     return mask
 
 
@@ -372,7 +394,7 @@ def get_air_name(materials: dict[str, Material]) -> str:
     for k, v in materials.items():
         if v.permittivity == 1 and v.permeability == 1:
             return k
-    background_material_name = list(materials.keys())[0]
+    background_material_name = next(iter(materials.keys()))
     print(f"Warning: Could not find air in {materials}\n Choosing '{background_material_name=}' instead.")
     return background_material_name
 
@@ -451,15 +473,16 @@ def normalize_polarization_for_source(
     propagation_axis: int,
     fixed_E_polarization_vector: tuple[float, float, float] | None = None,
     fixed_H_polarization_vector: tuple[float, float, float] | None = None,
+    dtype: jnp.dtype = jnp.float32,
 ) -> tuple[jax.Array, jax.Array]:
     # determine E/H polarization
     e_pol = fixed_E_polarization_vector
     h_pol = fixed_H_polarization_vector
     if h_pol is not None:
-        h_pol = jnp.asarray(h_pol, dtype=jnp.float32)
+        h_pol = jnp.asarray(h_pol, dtype=dtype)
         h_pol = h_pol / jnp.linalg.norm(h_pol)
     if e_pol is not None:
-        e_pol = jnp.asarray(e_pol, dtype=jnp.float32)
+        e_pol = jnp.asarray(e_pol, dtype=dtype)
         e_pol = e_pol / jnp.linalg.norm(e_pol)
     if e_pol is None:
         if h_pol is None:
@@ -468,6 +491,7 @@ def normalize_polarization_for_source(
             v_H=h_pol,
             direction=direction,
             propagation_axis=propagation_axis,
+            dtype=dtype,
         )
     if h_pol is None:
         if e_pol is None:
@@ -476,5 +500,142 @@ def normalize_polarization_for_source(
             v_E=e_pol,
             direction=direction,
             propagation_axis=propagation_axis,
+            dtype=dtype,
         )
     return e_pol, h_pol
+
+
+def tilted_polarization_vectors(
+    direction: Literal["+", "-"],
+    propagation_axis: int,
+    *,
+    fixed_E_polarization_vector: tuple[float, float, float] | None = None,
+    fixed_H_polarization_vector: tuple[float, float, float] | None = None,
+    azimuth_radians: float | jax.Array = 0.0,
+    elevation_radians: float | jax.Array = 0.0,
+    dtype: jnp.dtype = jnp.float32,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Resolve the E/H polarization unit vectors and wave vector of a plane wave.
+
+    Shared by the linearly-polarized plane sources and the analytic Gaussian
+    mode-overlap detector so both derive polarization and off-normal propagation
+    identically. The raw E/H polarization comes from
+    :func:`normalize_polarization_for_source`, the wave vector from
+    :func:`~fdtdx.core.linalg.get_wave_vector_raw`, and all three are rotated by the
+    azimuth/elevation angles (radians) about the ``(horizontal, vertical, propagation)``
+    axis triple via :func:`~fdtdx.core.linalg.rotate_vector` (a zero angle is the
+    identity, so normal incidence is unaffected).
+
+    Args:
+        direction: ``"+"`` (forward) or ``"-"`` (backward) along ``propagation_axis``.
+        propagation_axis: Physical propagation axis (0=x, 1=y, 2=z).
+        fixed_E_polarization_vector: Explicit E polarization 3-vector, or ``None``.
+        fixed_H_polarization_vector: Explicit H polarization 3-vector, or ``None``.
+        azimuth_radians: Tilt around the vertical axis, in radians.
+        elevation_radians: Tilt around the horizontal axis, in radians.
+        dtype: Float dtype used to build the vectors.
+
+    Returns:
+        ``(e_pol, h_pol, wave_vector)`` unit vectors, each of shape ``(3,)``.
+    """
+    e_pol, h_pol = normalize_polarization_for_source(
+        direction=direction,
+        propagation_axis=propagation_axis,
+        fixed_E_polarization_vector=fixed_E_polarization_vector,
+        fixed_H_polarization_vector=fixed_H_polarization_vector,
+        dtype=dtype,
+    )
+    wave_vector = get_wave_vector_raw(direction=direction, propagation_axis=propagation_axis, dtype=dtype)
+    axes_tpl = (*get_oriented_transverse_axes(propagation_axis), propagation_axis)
+    e_pol = rotate_vector(e_pol, azimuth_radians, elevation_radians, axes_tpl)
+    h_pol = rotate_vector(h_pol, azimuth_radians, elevation_radians, axes_tpl)
+    wave_vector = rotate_vector(wave_vector, azimuth_radians, elevation_radians, axes_tpl)
+    return e_pol, h_pol, wave_vector
+
+
+@overload
+def expand_to_3x3(arr: None) -> None: ...
+
+
+@overload
+def expand_to_3x3(arr: jax.Array | float) -> jax.Array: ...
+
+
+def expand_to_3x3(arr: jax.Array | float | None) -> jax.Array | None:
+    """Expands an array from shape (1/3/9, Nx, Ny, Nz) to (3, 3, Nx, Ny, Nz).
+
+    Args:
+        arr: Array with shape (1, Nx, Ny, Nz), (3, Nx, Ny, Nz), or (9, Nx, Ny, Nz),
+             a scalar (float), or None.
+
+    Returns:
+        Array with shape (3, 3, Nx, Ny, Nz) or (3, 3, 1, 1, 1) for scalars,
+        or None if input is None.
+        - scalar: [[a, 0, 0], [0, a, 0], [0, 0, a]] with shape (3, 3, 1, 1, 1)
+        - shape[0] == 1: [[a, 0, 0], [0, a, 0], [0, 0, a]] (isotropic) with shape (3, 3, Nx, Ny, Nz)
+        - shape[0] == 3: [[a, 0, 0], [0, b, 0], [0, 0, c]] (diagonal) with shape (3, 3, Nx, Ny, Nz)
+        - shape[0] == 9: reshape to (3, 3, Nx, Ny, Nz) (full tensor)
+    """
+    if arr is None:
+        return None
+
+    # Convert to array to handle scalars and ensure we have a jax array
+    arr = jnp.asarray(arr)
+
+    # Handle scalar case (e.g., inv_mu = 1.0 for non-magnetic materials)
+    if arr.ndim == 0:
+        # Create isotropic diagonal tensor that broadcasts
+        zero = jnp.zeros((), dtype=arr.dtype)
+        return jnp.array(
+            [
+                [[[[arr]]], [[[zero]]], [[[zero]]]],
+                [[[[zero]]], [[[arr]]], [[[zero]]]],
+                [[[[zero]]], [[[zero]]], [[[arr]]]],
+            ]
+        )
+
+    first_dim = arr.shape[0]
+    spatial_shape = arr.shape[1:]  # (Nx, Ny, Nz)
+
+    if first_dim == 1:
+        # Isotropic: [[a, 0, 0], [0, a, 0], [0, 0, a]]
+        zeros = jnp.zeros(spatial_shape, dtype=arr.dtype)
+        a = arr[0]
+        return jnp.stack([jnp.stack([a, zeros, zeros]), jnp.stack([zeros, a, zeros]), jnp.stack([zeros, zeros, a])])
+    elif first_dim == 3:
+        # Diagonal: [[a, 0, 0], [0, b, 0], [0, 0, c]]
+        zeros = jnp.zeros(spatial_shape, dtype=arr.dtype)
+        a, b, c = arr[0], arr[1], arr[2]
+        return jnp.stack([jnp.stack([a, zeros, zeros]), jnp.stack([zeros, b, zeros]), jnp.stack([zeros, zeros, c])])
+    else:  # first_dim == 9
+        # Full tensor: reshape to (3, 3, Nx, Ny, Nz)
+        return arr.reshape((3, 3, *spatial_shape))
+
+
+def pad_fields(
+    fields: jax.Array,
+    periodic_axes: tuple[bool, bool, bool],
+) -> jax.Array:
+    """Pads fields for boundary conditions.
+
+    Args:
+        fields (jax.Array): Fields to pad (3, Nx, Ny, Nz) for each field component
+        periodic_axes (tuple[bool, bool, bool]): Tuple of booleans indicating which axes use periodic boundaries
+
+    Returns:
+        jax.Array: Padded fields (3, Nx+2, Ny+2, Nz+2) with boundary conditions applied
+    """
+    padded_fields = fields
+
+    for i, periodic in enumerate(periodic_axes):
+        pad_mode = "wrap" if periodic else "constant"
+        # Create padding tuple for current axis
+        if i == 0:
+            pad_width = ((0, 0), (1, 1), (0, 0), (0, 0))
+        elif i == 1:
+            pad_width = ((0, 0), (0, 0), (1, 1), (0, 0))
+        else:  # i == 2
+            pad_width = ((0, 0), (0, 0), (0, 0), (1, 1))
+        padded_fields = jnp.pad(padded_fields, pad_width, mode=pad_mode)
+
+    return padded_fields
